@@ -6,7 +6,12 @@ import json
 jobs = [add_one, scheduled_job]
 r = Redis()
 
-worker = Worker(redis=r, jobs=jobs)
+
+def middleware_func():
+    return 'I am middleware'
+
+
+worker = Worker(redis=r, jobs=jobs, middleware=middleware_func)
 
 r.flushall()
 

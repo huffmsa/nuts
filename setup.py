@@ -7,11 +7,11 @@ print('packages')
 print(packages)
 
 setup(
-    name='carte_blanche_path',
+    name='nuts',
 
-    version='1.1.0',
+    version='0.1.0',
 
-    url='https://github.com/huffmsa/carte-blanche-path',
+    url='https://github.com/huffmsa/nuts',
 
     license='MIT',
 
@@ -19,7 +19,7 @@ setup(
 
     author_email='huffmsa@gmail.com',
 
-    description='A utility for setting project root directory',
+    description='A redis backed job scheduling and execution framework',
 
     packages=find_packages(exclude=['tests']),
 
@@ -32,7 +32,10 @@ setup(
 
     ],
 
-    install_requires=[],
+    install_requires=[
+        "python-dateutil==2.9.0.post0",
+        "redis==5.2.1"
+    ],
 
     test_suite=''
 )

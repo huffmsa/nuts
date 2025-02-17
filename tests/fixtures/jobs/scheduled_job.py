@@ -7,8 +7,10 @@ class Job(NutsJob):
         self.name = 'ScheduledJob'
         self.schedule = '0 * * * * ? *'
 
-    def run(self, args):
-        base = args.get('base')
+    def run(self, **kwargs):
+        base = kwargs.get('base')
 
         self.result = base + 1
         self.success = True
+
+        print("KWARGS", kwargs)

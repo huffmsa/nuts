@@ -16,18 +16,20 @@ class Worker():
     scheduler: Cron
     logger: logging.Logger
     jobs: list[NutsJob]
+    kwargs: dict[str, any]
     scheduled_queue: str
     pending_queue: str
     completed_queue: str
     last_run: datetime.datetime
     running_list: str
 
-    def __init__(self, redis: Redis, jobs: list[NutsJob]):
+    def __init__(self, redis: Redis, jobs: list[NutsJob], **kwargs):
         self.id = os.getpid()
         self.scheduled_queue = 'nuts|jobs|scheduled'
         self.running_list = 'nuts|job|running'
         self.pending_queue = 'nuts|jobs|pending'
         self.completed_queue = 'nuts|jobs|completed'
+        self.kwargs = kwargs
 
         self.last_run = datetime.datetime.fromtimestamp(0)
 
@@ -95,8 +97,9 @@ class Worker():
         self.redis.sadd(self.pending_queue, json.dumps([job_name, []]))
 
     def move_scheduled_to_pending(self):
-        now = datetime.datetime.now(datetime.timezone.utc).timestamp()
-        ready_jobs = self.redis.zrange(self.scheduled_queue, start=self.last_run.timestamp(), end=now, withscores=True)
+        now = round(datetime.datetime.now(datetime.timezone.utc).timestamp())
+        start = round(self.last_run.timestamp())
+        ready_jobs = self.redis.zrange(self.scheduled_queue, start=start, end=now, withscores=True)
 
         if len(ready_jobs) > 0:
             latest = max(j[0] for j in ready_jobs)
@@ -147,7 +150,7 @@ class Worker():
             self.logger.error(ex)
 
         try:
-            job.run(job_args)
+            job.run(**job_args, **self.kwargs)
 
             self.remove_running(job)
 
