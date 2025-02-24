@@ -10,3 +10,5 @@ setup.cfg
 data/
 **/__pycache__
 .python-version
+dist/*
+nuts_scheduler.egg-info
