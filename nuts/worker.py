@@ -94,7 +94,7 @@ class Worker():
         return is_leader
 
     def schedule_pending_job(self, job_name):
-        self.redis.sadd(self.pending_queue, json.dumps([job_name, []]))
+        self.redis.sadd(self.pending_queue, json.dumps([job_name, {}]))
 
     def move_scheduled_to_pending(self):
         now = round(datetime.datetime.now(datetime.timezone.utc).timestamp())
@@ -146,16 +146,13 @@ class Worker():
 
             self.move_pending_to_running(job, job_args)
 
-        except Exception as ex:
-            self.logger.error(ex)
-
-        try:
-            job.run(**job_args, **self.kwargs)
+            result = job.run(**job_args, **self.kwargs)
 
             self.remove_running(job)
 
             if job.success:
-                msg = f'SUCCESS: {job.name}, {job.result}'
+                loggable_result = job.result if job.result and job.result is not None else result
+                msg = f'SUCCESS: {job.name}, {loggable_result}'
 
                 self.logger.info(msg)
             else:
@@ -164,7 +161,6 @@ class Worker():
                 self.move_job_to_completed(job)
 
         except Exception as ex:
-            msg = f'Unhandled Error in job {job.name}: {ex}'
             self.logger.error(ex)
 
         # Post Execution
