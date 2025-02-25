@@ -1,3 +1,4 @@
+from typing import Union
 import json
 from redis import Redis
 import logging
@@ -20,8 +21,11 @@ class WorkQueue():
             datefmt="%Y-%m-%d %H:%M:%S",
         )
 
-    def publish(self, job_name: str, job_parameters: object):
-        payload = json.dumps([job_name, job_parameters])
-        self.logger.info(f'Added {payload} to the pending queue')
+    def publish(self, job_name: str, job_parameters: Union[object, list]):
+        try:
+            payload = json.dumps([job_name, job_parameters])
+            self.logger.info(f'Added {job_name} {payload}')
+            self.redis.sadd(self.pending_queue, payload)
 
-        self.redis.sadd(self.pending_queue, json.dumps([job_name, job_parameters]))
+        except Exception as ex:
+            self.logger.error(f'Error adding {job_name} {payload}: {ex}')
