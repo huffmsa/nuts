@@ -1,4 +1,4 @@
-import os
+from uuid import uuid4
 import json
 from redis import Redis
 from .job import NutsJob
@@ -11,7 +11,7 @@ class Worker():
     '''
         A NUTS worker
     '''
-    id: int
+    id: str
     redis: Redis
     scheduler: Cron
     logger: logging.Logger
@@ -22,14 +22,17 @@ class Worker():
     completed_queue: str
     last_run: datetime.datetime
     running_list: str
+    should_run: bool
 
     def __init__(self, redis: Redis, jobs: list[NutsJob], **kwargs):
-        self.id = os.getpid()
+        self.id = str(uuid4())
         self.scheduled_queue = 'nuts|jobs|scheduled'
         self.running_list = 'nuts|job|running'
         self.pending_queue = 'nuts|jobs|pending'
         self.completed_queue = 'nuts|jobs|completed'
         self.kwargs = kwargs
+        self.should_run = True
+        self.is_leader = False
 
         self.last_run = datetime.datetime.fromtimestamp(0)
 
@@ -38,10 +41,13 @@ class Worker():
         self.scheduler = Cron()
 
         self.logger = logging.getLogger(f'worker|{self.id}')
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s - %(levelname)s - %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
 
         self.jobs = []
-
-        logging.basicConfig(level=logging.INFO)
 
         is_leader = self.check_leader()
         if is_leader:
@@ -77,21 +83,32 @@ class Worker():
                     self.redis.zadd(self.pending_queue, {j.name: next_execution})
 
     def check_leader(self) -> bool:
-        is_leader = False
         leadership_check = self.redis.setnx('leader_id', self.id)
 
         if not leadership_check:
             leader_id = self.redis.get('leader_id')
             if leader_id == self.id:
-                self.redis.expire('leader_id', 600)
+                # Puts a 60 second life on the current leader so we aren't left in limbo if the leader worker dies ungracefully.
+                self.redis.expire('leader_id', 60)
 
-                is_leader = True
+                self.is_leader = True
 
         else:
-            self.redis.expire('leader_id', 600)
-            is_leader = True
+            # Puts a 60 second life on the current leader so we aren't left in limbo if the leader worker dies ungracefully.
+            self.redis.expire('leader_id', 60)
+            self.is_leader = True
 
-        return is_leader
+    def shutdown(self, signum, frame):
+        self.logger.info(f'Received shutdown command {signum}.')
+        self.should_run = False
+
+        if self.is_leader:
+            self.release_leader()
+
+    def release_leader(self):
+        if self.is_leader:
+            self.logger.info('Shutdown: Releasing leadership')
+            self.redis.expire('leader_id', -1)
 
     def schedule_pending_job(self, job_name):
         self.redis.sadd(self.pending_queue, json.dumps([job_name, {}]))
@@ -132,39 +149,52 @@ class Worker():
             self.redis.zadd(self.scheduled_queue, {job.name: next_execution})
 
     def run(self):
+        # Check that we have a leader each time this runs so we don't leave any jobs in limbo if the leader has gone down
+        self.check_leader()
 
-        is_leader = self.check_leader()
-        if is_leader:
+        if self.is_leader:
             # Move ready jobs to the pending queue
             self.move_scheduled_to_pending()
 
         try:
             data = self.redis.spop(self.pending_queue, 1)
-            [job_name, job_args] = json.loads(data[0])
-
-            job = [j for j in self.jobs if j.name == job_name][0]
-
-            self.move_pending_to_running(job, job_args)
-
-            result = job.run(**job_args, **self.kwargs)
-
-            self.remove_running(job)
-
-            if job.success:
-                loggable_result = job.result if job.result and job.result is not None else result
-                msg = f'SUCCESS: {job.name}, {loggable_result}'
-
-                self.logger.info(msg)
+            if not len(data):
+                self.logger.info('No pending job data')
+                return
             else:
-                self.logger.error(f'Error running job {job.name}: {job.error}')
-            if job.schedule:
-                self.move_job_to_completed(job)
+                [job_name, job_args] = json.loads(data[0])
+
+                jobs = [j for j in self.jobs if j.name == job_name]
+
+                if not len(jobs):
+                    self.logger.info(f'No job matches name {job_name}')
+                    return
+                else:
+                    job = jobs[0]
+                    self.move_pending_to_running(job, job_args)
+
+                    try:
+                        job.run(job_args, **self.kwargs)
+                    except Exception as ex:
+                        # Deal with user error gracefully
+                        self.logger.error(f'Unhandled Exception In Job: {job.name}: {ex}')
+
+                    self.remove_running(job)
+
+                    if job.success:
+                        msg = f'SUCCESS: {job.name}, {job.result}'
+
+                        self.logger.info(msg)
+                    else:
+                        self.logger.error(f'Error running job {job.name}: {job.error}')
+
+                    if job.schedule:
+                        self.move_job_to_completed(job)
 
         except Exception as ex:
-            self.logger.error(ex)
+            self.logger.error(f'Unhandled Exception in worker run process: {ex}')
 
         # Post Execution
 
-        if is_leader:
+        if self.is_leader:
             self.queue_completed_jobs()
-
