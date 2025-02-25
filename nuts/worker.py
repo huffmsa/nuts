@@ -110,13 +110,15 @@ class Worker():
             self.logger.info('Shutdown: Releasing leadership')
             self.redis.expire('leader_id', -1)
 
-    def schedule_pending_job(self, job_name, job_params = []):
+    def schedule_pending_job(self, job_name, job_params=[]):
         self.redis.sadd(self.pending_queue, json.dumps([job_name, job_params]))
 
     def move_scheduled_to_pending(self):
-        now = round(datetime.datetime.now(datetime.timezone.utc).timestamp())
+        now = datetime.datetime.now(datetime.timezone.utc)
+        now_timestamp = round(now.timestamp())
         start = round(self.last_run.timestamp())
-        ready_jobs = self.redis.zrange(self.scheduled_queue, start=start, end=now, withscores=True)
+
+        ready_jobs = self.redis.zrange(self.scheduled_queue, start=start, end=now_timestamp, withscores=True)
 
         if len(ready_jobs) > 0:
             latest = max(j[0] for j in ready_jobs)
@@ -124,6 +126,8 @@ class Worker():
 
         for job in ready_jobs:
             self.schedule_pending_job(job[0])
+
+        self.last_run = now
 
     def move_pending_to_running(self, job: NutsJob, job_args: list):
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
