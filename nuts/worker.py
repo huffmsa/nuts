@@ -110,8 +110,8 @@ class Worker():
             self.logger.info('Shutdown: Releasing leadership')
             self.redis.expire('leader_id', -1)
 
-    def schedule_pending_job(self, job_name):
-        self.redis.sadd(self.pending_queue, json.dumps([job_name, {}]))
+    def schedule_pending_job(self, job_name, job_params = []):
+        self.redis.sadd(self.pending_queue, json.dumps([job_name, job_params]))
 
     def move_scheduled_to_pending(self):
         now = round(datetime.datetime.now(datetime.timezone.utc).timestamp())
@@ -182,9 +182,12 @@ class Worker():
                     self.remove_running(job)
 
                     if job.success:
-                        msg = f'SUCCESS: {job.name}, {job.result}'
+                        self.logger.info(f'SUCCESS: {job.name}, {job.result}')
+                        # Light DAG support, can chain together jobs in a workflow by defining the next step that should
+                        # be taken after a job completes
+                        if job.next:
+                            self.schedule_pending_job(job.next, job.result)
 
-                        self.logger.info(msg)
                     else:
                         self.logger.error(f'Error running job {job.name}: {job.error}')
 

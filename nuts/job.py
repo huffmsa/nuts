@@ -10,6 +10,7 @@ class NutsJob():
     success: bool
     result: Any
     error: Exception
+    next: Union[str, None]
 
     def __init__(self):
         self.name = None
@@ -17,3 +18,4 @@ class NutsJob():
         self.success = False
         self.result = None
         self.error = None
+        self.next = None
