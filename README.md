@@ -39,7 +39,7 @@ r = Redis()
 
 worker = Worker(redis=r, jobs=[a_job, b_job])
 
-while True:
+while worker.should_run():
     worker.run()
 ```
 
