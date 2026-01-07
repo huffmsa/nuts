@@ -106,13 +106,18 @@ def test_workflow_failure_stops_execution():
         # Simulate first job failing
         wf.update('AddOne', 'failed', 'Test failure')
 
-        # Run workflows
-        worker.run_workflows()
-
-        # Workflow should be failed
+        # Verify workflow marked as failed before running
+        assert wf.status == 'failed'
         assert wf.has_failures()
 
-        # Second job should NOT be scheduled
+        # Run workflows - should detect failure, reset, and reschedule
+        worker.run_workflows()
+
+        # After run_workflows, the workflow should be reset and rescheduled
+        assert wf.status is None
+        assert not wf.has_failures()
+
+        # Second job should NOT be scheduled (because workflow failed before it could run)
         pending_jobs = r.smembers(worker.pending_queue)
         scheduled_job_count = sum(1 for job in pending_jobs if 'ScheduledJob' in str(job))
         assert scheduled_job_count == 0

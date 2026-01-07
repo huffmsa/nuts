@@ -35,6 +35,7 @@ def test_scheduled_job():
 
 
 def test_move_job_to_pending():
+    r.flushall()  # Clean up before test
     target_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=10)
     r.zadd(worker.scheduled_queue, {'AddOne': round(target_time.timestamp())})
 
