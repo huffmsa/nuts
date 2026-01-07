@@ -286,3 +286,28 @@ def test_parse_years():
     res = cron.parse_years('*/2', now)
     assert res[0] == 2026
     assert res[1] is False
+
+
+def test_parse_day_of_week_no_value_attribute_error():
+    """
+    Test that day-of-week parsing doesn't crash with AttributeError.
+    This test specifically checks the fix for the bug where calendar.monthrange()[0]
+    returns an integer, not an enum with a .value attribute.
+    """
+    # This should not raise AttributeError
+    now = datetime.datetime(2025, 1, 15, 0, 0, 0)  # Mid-month to avoid edge cases
+
+    # Test with specific day
+    res = cron.parse_day_of_week('3', now)  # Wednesday
+    assert isinstance(res[0], int)
+    assert isinstance(res[1], bool)
+
+    # Test with wildcard
+    res = cron.parse_day_of_week('*', now)
+    assert isinstance(res[0], int)
+    assert isinstance(res[1], bool)
+
+    # Test with frequency
+    res = cron.parse_day_of_week('1/2', now)
+    assert isinstance(res[0], int)
+    assert isinstance(res[1], bool)

@@ -1,10 +1,13 @@
 from uuid import uuid4
+import os
 import json
 from redis import Redis
 from .job import NutsJob
+from .workflow import NutsWorkflow
 from .cron import Cron
 import datetime
 import logging
+import yaml
 
 
 class Worker():
@@ -16,20 +19,24 @@ class Worker():
     scheduler: Cron
     logger: logging.Logger
     jobs: list[NutsJob]
+    workflows: list[NutsWorkflow]
     kwargs: dict[str, any]
     scheduled_queue: str
     pending_queue: str
     completed_queue: str
     last_run: datetime.datetime
-    running_list: str
+    running_queue: str
     should_run: bool
 
-    def __init__(self, redis: Redis, jobs: list[NutsJob], **kwargs):
+    def __init__(self, redis: Redis, jobs: list[NutsJob], workflow_directory: str = None, **kwargs):
         self.id = str(uuid4())
         self.scheduled_queue = 'nuts|jobs|scheduled'
-        self.running_list = 'nuts|job|running'
+        self.running_queue = 'nuts|jobs|running'
         self.pending_queue = 'nuts|jobs|pending'
         self.completed_queue = 'nuts|jobs|completed'
+        self.scheduled_workflow_queue = 'nuts|workflows|scheduled'
+        self.running_workflow_queue = 'nuts|workflows|running'
+        self.completed_workflow_queue = 'nuts|workflows|completed'
         self.kwargs = kwargs
         self.should_run = True
         self.is_leader = False
@@ -48,22 +55,65 @@ class Worker():
         )
 
         self.jobs = []
+        self.workflows = []
 
-        is_leader = self.check_leader()
-        if is_leader:
+        self.check_leader()
+
+        if self.is_leader and workflow_directory:
             self.logger.info(f'Worker {self.id} assuming leadership')
+            # Register the workflows
+            print(os.listdir(workflow_directory))
+            for workflow in os.listdir(workflow_directory):
+                if not workflow.endswith('.yaml'):
+                    continue
+                with open(os.path.join(workflow_directory, workflow), 'r') as f:
+                    wf = yaml.safe_load(f)
+                    self.logger.info(f'Registering Workflow {workflow}')
 
+                    workflow = NutsWorkflow(**wf['workflow'])
+
+                    # Validate workflow configuration
+                    is_valid, error = workflow.validate()
+                    if not is_valid:
+                        self.logger.error(f'Invalid workflow {workflow.name}: {error}')
+                        continue
+
+                    self.workflows.append(workflow)
+
+                    next_execution = self.scheduler.get_next_execution(workflow.schedule)
+                    next_execution = next_execution.timestamp()
+                    running_workflow = None
+                    try:
+                        pending = self.redis.zscan(self.scheduled_workflow_queue, match=workflow.name)
+                        if pending[1][0]:
+                            if pending[1][1] != next_execution:
+                                # Schedule has changed
+                                self.redis.zrem(self.scheduled_workflow_queue, workflow.name)
+                                self.redis.zadd(self.scheduled_workflow_queue, {workflow.name: next_execution})
+
+                    except Exception:
+                        pass
+
+                    running_workflow = self.redis.hget(self.running_workflow_queue, workflow.name)
+
+                    if not running_workflow:
+                        self.redis.zadd(self.scheduled_workflow_queue, {workflow.name: next_execution})
+                    else:
+                        print(running_workflow)
+                        workflow = NutsWorkflow(**json.loads(running_workflow))
+
+        # Register jobs with the worker
         for job in jobs:
             j = job.Job()
 
             self.jobs.append(j)
 
-            if is_leader and j.schedule:
+            # If this worker is the leader, register the job schedules
+            if self.is_leader and j.schedule:
                 self.logger.info(f'Registering Cron Job {j.name}')
 
                 next_execution = self.scheduler.get_next_execution(j.schedule).timestamp()
-                scheduled_job = False
-                running_job = None
+
                 try:
                     pending = self.redis.zscan('nuts|jobs|pending', match=j.name)
                     if pending[1][0]:
@@ -71,16 +121,9 @@ class Worker():
                             # Schedule has changed
                             self.redis.zrem(self.scheduled_queue, job.name)
                             self.redis.zadd(self.scheduled_queue, {job.name: next_execution})
-                        else:
-                            scheduled_job = True
 
                 except Exception:
                     pass
-
-                running_job = self.redis.hget(self.running_list, j.name)
-
-                if not scheduled_job and not running_job:
-                    self.redis.zadd(self.pending_queue, {j.name: next_execution})
 
     def check_leader(self) -> bool:
         leadership_check = self.redis.setnx('leader_id', self.id)
@@ -103,6 +146,10 @@ class Worker():
         self.should_run = False
 
         if self.is_leader:
+            for workflow in self.workflows:
+                if workflow.status == 'active':
+                    self.logger.info(f'Workflow {workflow.name} is active, persisting state')
+                    self.redis.hset(self.running_workflow_queue, workflow.name, json.dumps(workflow, default=lambda o: o.__dict__))
             self.release_leader()
 
     def release_leader(self):
@@ -116,41 +163,135 @@ class Worker():
     def move_scheduled_to_pending(self):
         now = datetime.datetime.now(datetime.timezone.utc)
         now_timestamp = round(now.timestamp())
-        start = round(self.last_run.timestamp())
 
-        ready_jobs = self.redis.zrange(self.scheduled_queue, start=start, end=now_timestamp, withscores=True)
+        ready_jobs = self.redis.zrange(self.scheduled_queue, start=0, end=now_timestamp, withscores=True)
 
         if len(ready_jobs) > 0:
-            latest = max(j[0] for j in ready_jobs)
+            latest = max(j[1] for j in ready_jobs)
             self.redis.zremrangebyscore(self.scheduled_queue, min=self.last_run.timestamp(), max=latest)
 
-        for job in ready_jobs:
-            self.schedule_pending_job(job[0])
+            for job in ready_jobs:
+                self.schedule_pending_job(job[0].decode())
 
-        self.last_run = now
+    def move_scheduled_workflows_to_running(self):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        now_timestamp = round(now.timestamp())
+
+        ready_workflows = self.redis.zrange(self.scheduled_workflow_queue, start=0, end=now_timestamp, withscores=True)
+
+        if len(ready_workflows) > 0:
+            latest = max(j[1] for j in ready_workflows)
+            self.redis.zremrangebyscore(self.scheduled_workflow_queue, min=self.last_run.timestamp(), max=latest)
+
+        for workflow in ready_workflows:
+            wf_name = workflow[0].decode()
+            wf = [w for w in self.workflows if w.name == wf_name][0]
+
+            wf.status = 'active'
 
     def move_pending_to_running(self, job: NutsJob, job_args: list):
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        self.redis.hset(self.running_list, f'{self.id}|{job.name}', json.dumps({'timestamp': now, 'args': job_args}))
+        self.redis.hset(self.running_queue, f'{self.id}|{job.name}', json.dumps({'timestamp': now, 'args': job_args}))
 
     def remove_running(self, job: NutsJob):
 
-        self.redis.hdel(self.running_list, f'{self.id}|{job.name}')
+        self.redis.hdel(self.running_queue, f'{self.id}|{job.name}')
 
-    def move_to_completed(self, job: NutsJob):
-        self.redis.sadd(self.completed_queue, job.name)
+    def move_to_completed(self, job: NutsJob, workflow_name: str = None):
+        if workflow_name:
+            name = f'{workflow_name}|{job.name}'
+        else:
+            name = job.name
+
+        job_data = {'success': job.success}
+        if hasattr(job, 'error') and job.error:
+            job_data['error'] = str(job.error)
+
+        self.redis.hset(self.completed_queue, name, json.dumps(job_data))
 
     def queue_completed_jobs(self):
 
-        completed_jobs = self.redis.smembers(self.completed_queue)
+        completed_jobs = self.redis.hkeys(self.completed_queue)
 
         for job_name in completed_jobs:
-            self.redis.srem(self.completed_queue, job_name)
-            job = [j for j in self.jobs if j.name == job_name.decode()][0]
+            job_results = self.redis.hget(self.completed_queue, job_name)
+            job_results = json.loads(job_results)
+            status = 'completed' if job_results.get('success', None) else 'failed'
+            # Remove from the completed queue
+            self.redis.hdel(self.completed_queue, job_name)
 
-            next_execution = self.scheduler.get_next_execution(job.schedule).timestamp()
+            if 'workflow' in job_name.decode():
+                [workflow_name, job_name] = job_name.decode().split('|')
+                workflow_name = workflow_name.replace('workflow-', '')
+                wf = [w for w in self.workflows if w.name == workflow_name][0]
 
-            self.redis.zadd(self.scheduled_queue, {job.name: next_execution})
+                # Pass error information if job failed
+                error_msg = job_results.get('error', None) if status == 'failed' else None
+                wf.update(job_name, status, error_msg)
+
+            else:
+                job = [j for j in self.jobs if j.name == job_name.decode()][0]
+
+                next_execution = self.scheduler.get_next_execution(job.schedule).timestamp()
+
+                self.redis.zadd(self.scheduled_queue, {job.name: next_execution})
+
+    def run_workflows(self):
+        """
+        Execute active workflows by checking dependencies and scheduling ready jobs.
+
+        This method:
+        - Moves scheduled workflows to running state
+        - Checks for job failures (stops workflow if any job failed)
+        - Identifies next ready job based on dependencies
+        - Schedules ready jobs to pending queue
+        - Reschedules completed/failed workflows for next run
+
+        Workflows are executed by the leader worker only.
+        """
+        # Move ready  to the pending queue
+        self.move_scheduled_workflows_to_running()
+
+        try:
+            for workflow in self.workflows:
+                if workflow.status == 'active':
+                    self.logger.info(f'Running workflow {workflow.name}')
+
+                    # Check for failures first
+                    if workflow.has_failures():
+                        self.logger.error(f'Workflow {workflow.name} failed: {workflow.error}')
+                        workflow.status = 'failed'
+                        # Reschedule for next run
+                        workflow.reset()
+                        next_execution = self.scheduler.get_next_execution(workflow.schedule).timestamp()
+                        self.redis.zadd(self.scheduled_workflow_queue, {workflow.name: next_execution})
+                        continue
+
+                    try:
+                        next_job = workflow.run()
+                        if not next_job and workflow.completed():
+                            self.logger.info(f'Workflow {workflow.name} completed successfully')
+                            workflow.reset()
+                            next_execution = self.scheduler.get_next_execution(workflow.schedule).timestamp()
+                            print(self.scheduler.get_next_execution(workflow.schedule), datetime.datetime.now(datetime.timezone.utc))
+                            self.redis.zadd(self.scheduled_workflow_queue, {workflow.name: next_execution})
+                        elif next_job:
+                            self.logger.info(f'Workflow {workflow.name} next job {next_job}')
+
+                            self.schedule_pending_job(f'workflow-{workflow.name}|{next_job}')
+                            workflow.update(next_job, 'pending')
+
+                    except Exception as ex:
+                        # Deal with user error gracefully
+                        self.logger.error(f'Unhandled Exception In Workflow: {workflow.name}: {ex}')
+                        workflow.status = 'failed'
+                        workflow.error = str(ex)
+                        workflow.reset()
+                        next_execution = self.scheduler.get_next_execution(workflow.schedule).timestamp()
+                        self.redis.zadd(self.scheduled_workflow_queue, {workflow.name: next_execution})
+
+        except Exception as ex:
+            self.logger.error(f'Unhandled Exception in run_workflows: {ex}')
 
     def run(self):
         # Check that we have a leader each time this runs so we don't leave any jobs in limbo if the leader has gone down
@@ -159,14 +300,19 @@ class Worker():
         if self.is_leader:
             # Move ready jobs to the pending queue
             self.move_scheduled_to_pending()
+            self.run_workflows()
 
         try:
             data = self.redis.spop(self.pending_queue, 1)
             if not len(data):
-                self.logger.info('No pending job data')
                 return
             else:
                 [job_name, job_args] = json.loads(data[0])
+                for_workflow = False
+                workflow_name = None
+                if 'workflow' in job_name:
+                    for_workflow = True
+                    [workflow_name, job_name] = job_name.split('|')
 
                 jobs = [j for j in self.jobs if j.name == job_name]
 
@@ -178,7 +324,12 @@ class Worker():
                     self.move_pending_to_running(job, job_args)
 
                     try:
-                        job.run(job_args, **self.kwargs)
+                        # Handle both dict arguments and backwards compatibility
+                        if isinstance(job_args, dict):
+                            job.run(**job_args, **self.kwargs)
+                        else:
+                            # For backwards compatibility or empty args
+                            job.run(**self.kwargs)
                     except Exception as ex:
                         # Deal with user error gracefully
                         self.logger.error(f'Unhandled Exception In Job: {job.name}: {ex}')
@@ -195,13 +346,14 @@ class Worker():
                     else:
                         self.logger.error(f'Error running job {job.name}: {job.error}')
 
-                    if job.schedule:
-                        self.move_job_to_completed(job)
+                    if job.schedule or for_workflow:
+                        self.move_to_completed(job, workflow_name)
+
+                self.last_run = datetime.datetime.now(datetime.timezone.utc)
 
         except Exception as ex:
             self.logger.error(f'Unhandled Exception in worker run process: {ex}')
 
         # Post Execution
-
         if self.is_leader:
             self.queue_completed_jobs()

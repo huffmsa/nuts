@@ -1,3 +1,4 @@
+import datetime
 from ..nuts.worker import Worker
 from redis import Redis
 from .fixtures.jobs import add_one, scheduled_job
@@ -11,7 +12,7 @@ def middleware_func():
     return 'I am middleware'
 
 
-worker = Worker(redis=r, jobs=jobs, middleware=middleware_func)
+worker = Worker(redis=r, jobs=jobs, workflow_directory='./', middleware=middleware_func)
 
 r.flushall()
 
@@ -25,9 +26,21 @@ def test_worker():
 
 
 def test_scheduled_job():
-    r.sadd(worker.completed_queue, 'ScheduledJob')
+    r.hset(worker.completed_queue, 'ScheduledJob', '{"status": "completed"}')
 
     worker.queue_completed_jobs()
 
     scheduled_jobs = r.zscan(worker.scheduled_queue, match='ScheduledJob')
     assert len(scheduled_jobs[1]) == 1
+
+
+def test_move_job_to_pending():
+    target_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=10)
+    r.zadd(worker.scheduled_queue, {'AddOne': round(target_time.timestamp())})
+
+    worker.move_scheduled_to_pending()
+
+    pending_jobs = r.smembers(worker.pending_queue)
+    assert len(pending_jobs) == 1
+
+

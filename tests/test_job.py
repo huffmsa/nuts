@@ -4,6 +4,7 @@ from ..nuts.job import NutsJob
 def test_job():
     class Job(NutsJob):
         def __init__(self):
+            super().__init__()
             self.name = 'job'
 
         def run(self, args):
@@ -21,8 +22,23 @@ def test_job():
 def test_job_failure():
     class FailJob(NutsJob):
         def __init__(self):
+            super().__init__()
             self.name = 'fail_job'
 
-        def run(self, args):
-            self.success = False
+        def run(self, **kwargs):
+            try:
+                # Simulate a failure condition
+                raise ValueError("Intentional failure for testing")
+            except Exception as e:
+                self.success = False
+                self.error = e
 
+    job = FailJob()
+    job.run()
+
+    # Assertions for failure test
+    assert job.name == 'fail_job'
+    assert job.success is False
+    assert job.error is not None
+    assert isinstance(job.error, ValueError)
+    assert 'Intentional failure' in str(job.error)

@@ -16,7 +16,7 @@ class Cron():
             raise Exception(f'Invalid expression {input}: Valid examples include: */int, int/int')
 
     def __get_week_structure(self, year: int, month: int) -> list[int]:
-        start_of_month = calendar.monthrange(year, month)[0].value
+        start_of_month = calendar.monthrange(year, month)[0]
         week_structure = []
         while len(week_structure) < 7:
             if start_of_month < 8:
@@ -26,7 +26,9 @@ class Cron():
                 start_of_month = 1
         return week_structure
 
-    def get_next_execution(self, schedule: str, now: datetime.datetime = datetime.datetime.now(datetime.timezone.utc)) -> int:
+    def get_next_execution(self, schedule: str, now: datetime.datetime = None) -> int:
+        if now is None:
+            now = datetime.datetime.now(datetime.timezone.utc)
         try:
             [seconds, minutes, hours, day_of_week, month, day_of_month, year] = schedule.split(' ')
         except Exception:

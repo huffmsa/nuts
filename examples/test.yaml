@@ -1,0 +1,9 @@
+workflow:
+  name: test-workflow
+  schedule: "0/2 0 0 ? * * *"
+  jobs:
+    - name: TestA
+      requires: null
+    - name: TestB
+      requires:
+        - TestA
