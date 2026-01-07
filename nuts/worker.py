@@ -1,7 +1,7 @@
 from uuid import uuid4
 import os
 import json
-from typing import Any
+from typing import Any, Protocol
 from redis import Redis
 from .job import NutsJob
 from .workflow import NutsWorkflow
@@ -9,6 +9,11 @@ from .cron import Cron
 import datetime
 import logging
 import yaml
+
+
+class JobModule(Protocol):
+    """Protocol for job modules that contain a Job class."""
+    Job: type[NutsJob]
 
 
 class Worker():
@@ -29,7 +34,7 @@ class Worker():
     running_queue: str
     should_run: bool
 
-    def __init__(self, redis: Redis, jobs: list[NutsJob], workflow_directory: str = None, **kwargs):
+    def __init__(self, redis: Redis, jobs: list[JobModule], workflow_directory: str = None, **kwargs):
         self.id = str(uuid4())
         self.scheduled_queue = 'nuts|jobs|scheduled'
         self.running_queue = 'nuts|jobs|running'
