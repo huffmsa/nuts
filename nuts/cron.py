@@ -5,7 +5,7 @@ import calendar
 
 class Cron():
 
-    def __get_start_frequency(self, input: str, base: str = None) -> list[str]:
+    def __get_start_frequency(self, input: str, base: str = None) -> list[int]:
         try:
             [start, frequency] = input.split('/')
             if start == '*':
@@ -26,7 +26,7 @@ class Cron():
                 start_of_month = 1
         return week_structure
 
-    def get_next_execution(self, schedule: str, now: datetime.datetime = None) -> int:
+    def get_next_execution(self, schedule: str, now: datetime.datetime = None) -> datetime.datetime:
         if now is None:
             now = datetime.datetime.now(datetime.timezone.utc)
         try:
@@ -63,7 +63,7 @@ class Cron():
 
         return res
 
-    def parse_seconds(self, seconds: str, now: datetime.datetime) -> list[int, bool]:
+    def parse_seconds(self, seconds: str, now: datetime.datetime) -> tuple[int, bool]:
         if seconds == '*':
             seconds = '0/1'
 
@@ -79,7 +79,7 @@ class Cron():
         except Exception:
             return [start, True]
 
-    def parse_minutes(self, minutes: str, now: datetime.datetime) -> list[int, False]:
+    def parse_minutes(self, minutes: str, now: datetime.datetime) -> tuple[int, bool]:
         if minutes == '*':
             minutes = '0/1'
 
@@ -95,7 +95,7 @@ class Cron():
         except Exception:
             return [start, True]
 
-    def parse_hours(self, hours: str, now: datetime.datetime) -> list[int, bool]:
+    def parse_hours(self, hours: str, now: datetime.datetime) -> tuple[int, bool]:
         if hours == '*':
             hours = '0/1'
 
@@ -111,7 +111,7 @@ class Cron():
         except Exception:
             return [start, True]
 
-    def parse_day_of_month(self, days: str, now: datetime.datetime) -> list[int, bool]:
+    def parse_day_of_month(self, days: str, now: datetime.datetime) -> tuple[int, bool]:
         end_of_month = calendar.monthrange(now.year, now.month)[1]
         if days == '*':
             days = '1/1'
@@ -148,7 +148,7 @@ class Cron():
                     pass
         return upcoming
 
-    def parse_day_of_week(self, days: str, now: datetime.datetime) -> int:
+    def parse_day_of_week(self, days: str, now: datetime.datetime) -> tuple[int, bool]:
         week_structure = self.__get_week_structure(now.year, now.month)
         if days == '*':
             days = f'{week_structure[0]}/1'
@@ -180,7 +180,7 @@ class Cron():
 
                 return [upcoming[0], True]
 
-    def parse_months(self, months: str, now: datetime.datetime) -> int:
+    def parse_months(self, months: str, now: datetime.datetime) -> tuple[int, bool]:
         if months == '*':
             months = '1/1'
 
@@ -196,7 +196,7 @@ class Cron():
         except Exception:
             return [start, True]
 
-    def parse_years(self, years: str, now: datetime.datetime) -> int:
+    def parse_years(self, years: str, now: datetime.datetime) -> tuple[int, bool]:
         if years == '*':
             years = '1970/1'
 

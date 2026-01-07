@@ -1,6 +1,7 @@
 from uuid import uuid4
 import os
 import json
+from typing import Any
 from redis import Redis
 from .job import NutsJob
 from .workflow import NutsWorkflow
@@ -20,7 +21,7 @@ class Worker():
     logger: logging.Logger
     jobs: list[NutsJob]
     workflows: list[NutsWorkflow]
-    kwargs: dict[str, any]
+    kwargs: dict[str, Any]
     scheduled_queue: str
     pending_queue: str
     completed_queue: str

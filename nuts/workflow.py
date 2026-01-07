@@ -102,7 +102,7 @@ class NutsWorkflow:
 
         return True
 
-    def run(self):
+    def run(self) -> Union[str, bool]:
         """
         Determine the next job to execute in the workflow.
 
