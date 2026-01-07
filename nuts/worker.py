@@ -106,6 +106,8 @@ class Worker():
                         self.redis.zadd(self.scheduled_workflow_queue, {workflow.name: next_execution})
                     else:
                         print(running_workflow)
+                        # Type guard: running_workflow is bytes here (not None)
+                        assert isinstance(running_workflow, bytes)
                         workflow = NutsWorkflow(**json.loads(running_workflow))
 
         # Register jobs with the worker
@@ -220,8 +222,12 @@ class Worker():
         completed_jobs = self.redis.hkeys(self.completed_queue)
 
         for job_name in completed_jobs:
-            job_results = self.redis.hget(self.completed_queue, job_name)
-            job_results = json.loads(job_results)
+            job_results_raw = self.redis.hget(self.completed_queue, job_name)
+            if not job_results_raw:
+                continue  # Skip if no results found
+            # Type guard: job_results_raw is bytes here (not None)
+            assert isinstance(job_results_raw, bytes)
+            job_results = json.loads(job_results_raw)
             status = 'completed' if job_results.get('success', None) else 'failed'
             # Remove from the completed queue
             self.redis.hdel(self.completed_queue, job_name)
@@ -313,6 +319,8 @@ class Worker():
             if not len(data):
                 return
             else:
+                # Type guard: data[0] is bytes (from redis)
+                assert isinstance(data[0], bytes)
                 [job_name, job_args] = json.loads(data[0])
                 for_workflow = False
                 workflow_name = None
