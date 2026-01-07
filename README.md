@@ -39,7 +39,7 @@ r = Redis()
 
 worker = Worker(redis=r, jobs=[a_job, b_job])
 
-while worker.should_run():
+while worker.should_run:
     worker.run()
 ```
 
@@ -81,3 +81,109 @@ Setting `success` on completion of your job is required.
 ### Chaining Jobs - DAG
 
 NUTS supports a very basic directed acyclic graph style functionality. When defining your job, setting the `next` attribute of your class to the name of the next job you would like to run will tell the worker to enqueue that job with the data stored on your jobs `result` attribute as parameters. This is useful for breaking up functionality into logical components, or break up long processes into more controllable steps.
+
+### Workflows
+
+NUTS supports complex workflows (DAGs) through YAML configuration files. Workflows allow you to define multi-job pipelines with dependencies, scheduling, and automatic error handling.
+
+#### Creating a Workflow
+
+Create a YAML file defining your workflow:
+
+```yaml
+# data_pipeline.yaml
+workflow:
+  name: data-pipeline
+  schedule: "0 0 2 ? * * *"  # Daily at 2 AM
+  jobs:
+    - name: ExtractData
+      requires: null  # Root job - no dependencies
+    - name: TransformData
+      requires:
+        - ExtractData  # Waits for ExtractData to complete
+    - name: LoadData
+      requires:
+        - TransformData
+    - name: SendNotification
+      requires:
+        - LoadData
+```
+
+#### Loading Workflows
+
+Pass a directory containing workflow YAML files to the Worker:
+
+```python
+from nuts import Worker
+from redis import Redis
+from .jobs import extract_data, transform_data, load_data, send_notification
+
+r = Redis()
+
+worker = Worker(
+    redis=r,
+    jobs=[extract_data, transform_data, load_data, send_notification],
+    workflow_directory='./workflows'  # Directory containing .yaml files
+)
+
+while worker.should_run:
+    worker.run()
+```
+
+#### Workflow Features
+
+- **Dependency Management**: Jobs automatically wait for their dependencies to complete
+- **Parallel Execution**: Jobs without dependencies can run in parallel
+- **Error Handling**: If any job fails, the workflow stops and marks as failed
+- **Automatic Rescheduling**: Workflows reschedule automatically based on their cron schedule
+- **State Persistence**: Worker failures don't lose workflow progress (state saved to Redis)
+
+#### Workflow Job Requirements
+
+Jobs used in workflows must be registered with the Worker and follow the standard NutsJob pattern:
+
+```python
+from nuts import NutsJob
+
+class Job(NutsJob):
+    def __init__(self):
+        super().__init__()
+        self.name = 'ExtractData'  # Must match workflow YAML
+
+    def run(self, **kwargs):
+        # Job logic here
+        self.result = {'data': 'extracted'}
+        self.success = True
+```
+
+**Important**: Job names in the workflow YAML must exactly match the `name` attribute of your job classes.
+
+#### Workflow Validation
+
+Workflows are validated on load to catch common errors:
+
+- Circular dependencies (job A requires B, B requires A)
+- Missing job definitions (workflow references jobs not registered with Worker)
+- Orphaned jobs (no path from root jobs to job)
+
+Invalid workflows are logged and skipped.
+
+#### Example: Data Pipeline
+
+See the `examples/` directory for a complete data pipeline workflow implementation including:
+
+- **ExtractData**: Fetches data from an API
+- **TransformData**: Cleans and processes data
+- **LoadData**: Loads data to warehouse
+- **SendNotification**: Sends completion notification
+
+This demonstrates a common ETL pattern with sequential dependencies.
+
+#### Workflow vs DAG Jobs
+
+NUTS supports two ways to chain jobs:
+
+1. **Workflows (YAML)**: Best for complex pipelines, scheduled operations, and when you need visual workflow definitions
+2. **DAG Jobs (job.next)**: Best for simple linear chains and dynamic job chaining based on results
+
+Workflows are recommended for most use cases as they provide better visibility, validation, and error handling.

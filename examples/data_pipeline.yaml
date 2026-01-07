@@ -1,0 +1,15 @@
+workflow:
+  name: data-pipeline
+  schedule: "0 0 2 ? * * *"  # Daily at 2 AM
+  jobs:
+    - name: ExtractData
+      requires: null
+    - name: TransformData
+      requires:
+        - ExtractData
+    - name: LoadData
+      requires:
+        - TransformData
+    - name: SendNotification
+      requires:
+        - LoadData
