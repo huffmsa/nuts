@@ -40,6 +40,7 @@ class Worker():
         self.running_queue = 'nuts|jobs|running'
         self.pending_queue = 'nuts|jobs|pending'
         self.completed_queue = 'nuts|jobs|completed'
+        self.cancel_queue = 'nuts|jobs|cancel'
         self.scheduled_workflow_queue = 'nuts|workflows|scheduled'
         self.running_workflow_queue = 'nuts|workflows|running'
         self.completed_workflow_queue = 'nuts|workflows|completed'
@@ -167,6 +168,14 @@ class Worker():
 
     def schedule_pending_job(self, job_name, job_params=[]):
         self.redis.sadd(self.pending_queue, json.dumps([job_name, job_params]))
+
+    def is_job_cancelled(self, job_name: str) -> bool:
+        """Check if a cancellation has been requested for this job."""
+        return bool(self.redis.sismember(self.cancel_queue, job_name))
+
+    def clear_job_cancellation(self, job_name: str):
+        """Clear the cancellation flag for a job."""
+        self.redis.srem(self.cancel_queue, job_name)
 
     def move_scheduled_to_pending(self):
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -335,6 +344,13 @@ class Worker():
                     return
                 else:
                     job = jobs[0]
+
+                    # Check if cancellation was requested for this job
+                    if self.is_job_cancelled(job_name):
+                        self.logger.info(f'Job {job_name} was cancelled, skipping execution')
+                        self.clear_job_cancellation(job_name)
+                        return
+
                     self.move_pending_to_running(job, job_args)
 
                     try:
