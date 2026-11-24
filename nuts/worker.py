@@ -92,8 +92,8 @@ class Worker():
                     running_workflow = None
                     try:
                         pending = self.redis.zscan(self.scheduled_workflow_queue, match=workflow.name)
-                        if pending[1][0]:
-                            if pending[1][1] != next_execution:
+                        if pending[1]:
+                            if pending[1][0][1] != next_execution:
                                 # Schedule has changed
                                 self.redis.zrem(self.scheduled_workflow_queue, workflow.name)
                                 self.redis.zadd(self.scheduled_workflow_queue, {workflow.name: next_execution})
@@ -123,27 +123,34 @@ class Worker():
 
                 next_execution = self.scheduler.get_next_execution(j.schedule).timestamp()
 
+                already_scheduled = False
                 try:
-                    pending = self.redis.zscan('nuts|jobs|pending', match=j.name)
-                    if pending[1][0]:
-                        if pending[1][1] != next_execution:
+                    pending = self.redis.zscan(self.scheduled_queue, match=j.name)
+                    if pending[1]:
+                        already_scheduled = True
+                        if pending[1][0][1] != next_execution:
                             # Schedule has changed
-                            self.redis.zrem(self.scheduled_queue, job.name)
-                            self.redis.zadd(self.scheduled_queue, {job.name: next_execution})
+                            self.redis.zrem(self.scheduled_queue, j.name)
+                            self.redis.zadd(self.scheduled_queue, {j.name: next_execution})
 
                 except Exception:
                     pass
+
+                if not already_scheduled:
+                    self.redis.zadd(self.scheduled_queue, {j.name: next_execution})
 
     def check_leader(self) -> bool:
         leadership_check = self.redis.setnx('leader_id', self.id)
 
         if not leadership_check:
             leader_id = self.redis.get('leader_id')
-            if leader_id == self.id:
+            if leader_id is not None and leader_id.decode() == self.id:
                 # Puts a 60 second life on the current leader so we aren't left in limbo if the leader worker dies ungracefully.
                 self.redis.expire('leader_id', 60)
 
                 self.is_leader = True
+            else:
+                self.is_leader = False
 
         else:
             # Puts a 60 second life on the current leader so we aren't left in limbo if the leader worker dies ungracefully.
@@ -181,7 +188,7 @@ class Worker():
         now = datetime.datetime.now(datetime.timezone.utc)
         now_timestamp = round(now.timestamp())
 
-        ready_jobs = self.redis.zrange(self.scheduled_queue, start=0, end=now_timestamp, withscores=True)
+        ready_jobs = self.redis.zrange(self.scheduled_queue, start=0, end=now_timestamp, byscore=True, withscores=True)
 
         if len(ready_jobs) > 0:
             latest = max(j[1] for j in ready_jobs)
@@ -194,7 +201,7 @@ class Worker():
         now = datetime.datetime.now(datetime.timezone.utc)
         now_timestamp = round(now.timestamp())
 
-        ready_workflows = self.redis.zrange(self.scheduled_workflow_queue, start=0, end=now_timestamp, withscores=True)
+        ready_workflows = self.redis.zrange(self.scheduled_workflow_queue, start=0, end=now_timestamp, byscore=True, withscores=True)
 
         if len(ready_workflows) > 0:
             latest = max(j[1] for j in ready_workflows)
@@ -275,7 +282,7 @@ class Worker():
 
         try:
             for workflow in self.workflows:
-                if workflow.status == 'active':
+                if workflow.status in ('active', 'failed'):
                     self.logger.info(f'Running workflow {workflow.name}')
 
                     # Check for failures first
