@@ -187,45 +187,71 @@ class NutsWorkflow:
         Validate workflow configuration for common errors.
         Returns (is_valid, error_message)
         """
-        # Check for circular dependencies
-        visited = set()
+        return validate_dag([(j.name, j.requires) for j in self.jobs])
 
-        def has_cycle(job_name, path):
-            if job_name in path:
-                return True
-            if job_name in visited:
-                return False
+    def to_plan(self) -> list[dict]:
+        """
+        Convert this template's jobs into a plan usable by
+        nuts.instance.create_instance() -- this is what makes YAML
+        workflow_directory loading "sugar" over dynamic instance creation:
+        the leader spawns a fresh instance from this plan on each due
+        cron occurrence instead of mutating a shared singleton.
+        """
+        return [
+            {'step_id': j.name, 'op': j.name, 'kind': 'job', 'requires': j.requires}
+            for j in self.jobs
+        ]
 
-            visited.add(job_name)
-            path.add(job_name)
 
-            job = next((j for j in self.jobs if j.name == job_name), None)
-            if not job or not job.requires:
-                path.remove(job_name)
-                return False
+def validate_dag(nodes: list[tuple[str, Union[list[str], None]]]) -> tuple[bool, str]:
+    """
+    Structural validation for any (name, requires) DAG -- cycle detection,
+    missing-dependency checks, and orphan-node detection. Pure data
+    validation with no dependency on any live workflow/instance state, so
+    it's shared by NutsWorkflow.validate() (static YAML templates) and
+    nuts.instance.create_instance() (per-instance dynamic plans).
+    Returns (is_valid, error_message).
+    """
+    by_name = {name: requires for name, requires in nodes}
 
-            for req in job.requires:
-                if has_cycle(req, path):
-                    return True
+    visited = set()
 
-            path.remove(job_name)
+    def has_cycle(name, path):
+        if name in path:
+            return True
+        if name in visited:
             return False
 
-        for job in self.jobs:
-            if has_cycle(job.name, set()):
-                return False, f"Circular dependency detected involving job: {job.name}"
+        visited.add(name)
+        path.add(name)
 
-        # Check that all required jobs exist
-        job_names = {j.name for j in self.jobs}
-        for job in self.jobs:
-            if job.requires:
-                for req in job.requires:
-                    if req not in job_names:
-                        return False, f"Job {job.name} requires non-existent job: {req}"
+        requires = by_name.get(name)
+        if not requires:
+            path.remove(name)
+            return False
 
-        # Check for orphaned jobs (no path from root to job)
-        root_jobs = [j for j in self.jobs if not j.requires]
-        if not root_jobs:
-            return False, "Workflow has no root jobs (all jobs have requirements)"
+        for req in requires:
+            if has_cycle(req, path):
+                return True
 
-        return True, ""
+        path.remove(name)
+        return False
+
+    for name, _ in nodes:
+        if has_cycle(name, set()):
+            return False, f"Circular dependency detected involving job: {name}"
+
+    # Check that all required jobs exist
+    names = set(by_name.keys())
+    for name, requires in nodes:
+        if requires:
+            for req in requires:
+                if req not in names:
+                    return False, f"Job {name} requires non-existent job: {req}"
+
+    # Check for orphaned jobs (no path from root to job)
+    root_jobs = [name for name, requires in nodes if not requires]
+    if not root_jobs:
+        return False, "Workflow has no root jobs (all jobs have requirements)"
+
+    return True, ""

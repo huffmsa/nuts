@@ -1,5 +1,5 @@
 import pytest
-from ..nuts.workflow import NutsWorkflow, WorkflowJob
+from ..nuts.workflow import NutsWorkflow, WorkflowJob, validate_dag
 
 
 def test_workflow_initialization():
@@ -244,3 +244,49 @@ def test_workflow_check_requirements():
 
     # Now job2's requirements are met
     assert wf.check_requirements(wf.jobs[1])
+
+
+def test_to_plan_converts_template_jobs_to_plan_steps():
+    """
+    NutsWorkflow.to_plan() is what makes YAML workflow_directory loading
+    sugar over nuts.instance.create_instance() -- the leader spawns a fresh
+    instance from this plan on each due cron occurrence.
+    """
+    wf = NutsWorkflow(
+        name='test-workflow',
+        schedule='0 0 * * * ? *',
+        jobs=[
+            {'name': 'job1', 'requires': None},
+            {'name': 'job2', 'requires': ['job1']},
+        ]
+    )
+
+    plan = wf.to_plan()
+
+    assert plan == [
+        {'step_id': 'job1', 'op': 'job1', 'kind': 'job', 'requires': None},
+        {'step_id': 'job2', 'op': 'job2', 'kind': 'job', 'requires': ['job1']},
+    ]
+
+
+def test_validate_dag_valid():
+    is_valid, error = validate_dag([('a', None), ('b', ['a'])])
+    assert is_valid
+    assert error == ""
+
+
+def test_validate_dag_cycle():
+    is_valid, error = validate_dag([('a', ['b']), ('b', ['a'])])
+    assert not is_valid
+    assert 'circular' in error.lower()
+
+
+def test_validate_dag_missing_dependency():
+    is_valid, error = validate_dag([('a', ['nonexistent'])])
+    assert not is_valid
+    assert 'nonexistent' in error
+
+
+def test_validate_dag_no_root_nodes():
+    is_valid, error = validate_dag([('a', ['b']), ('b', ['a'])])
+    assert not is_valid

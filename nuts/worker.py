@@ -1,49 +1,73 @@
 from uuid import uuid4
 import os
 import json
-from typing import Any, Protocol
+import random
+from typing import Any
 from redis import Redis
-from .job import NutsJob
+from .job import NutsJob, JobModule, JobRegistry
 from .workflow import NutsWorkflow
 from .cron import Cron
+from .concurrency import ConcurrencyGate
+from . import dispatch
+from . import instance
 import datetime
 import logging
 import yaml
 
 
-class JobModule(Protocol):
-    """Protocol for job modules that contain a Job class."""
-    Job: type[NutsJob]
+class RetryPolicy:
+    '''Exponential backoff with jitter, capped, plus a max attempt count before DLQ.'''
+    def __init__(self, base: float = 5, cap: float = 300, max_attempts: int = 5):
+        self.base = base
+        self.cap = cap
+        self.max_attempts = max_attempts
+
+    def delay(self, attempt: int) -> float:
+        raw = min(self.cap, self.base * (2 ** (attempt - 1)))
+        jitter = raw * 0.2
+        return max(0.0, raw + random.uniform(-jitter, jitter))
 
 
 class Worker():
     '''
-        A NUTS worker
+        A NUTS worker.
+
+        Delivery is backed by Redis Streams + consumer groups: entries
+        aren't gone until XACK, a crashed worker's claim sits in the Pending
+        Entries List and gets reclaimed via XAUTOCLAIM, and priority is a
+        small number of discrete streams checked in strict order. Workflow
+        instances are durable, per-entity documents in Redis (nuts/instance.py)
+        rather than worker-memory objects, so any worker can compute "what's
+        next" from persisted state alone.
     '''
     id: str
     redis: Redis
     scheduler: Cron
     logger: logging.Logger
-    jobs: list[NutsJob]
-    workflows: list[NutsWorkflow]
+    registry: JobRegistry
+    workflow_templates: list[NutsWorkflow]
+    concurrency: ConcurrencyGate
+    retry_policy: RetryPolicy
     kwargs: dict[str, Any]
-    scheduled_queue: str
-    pending_queue: str
-    completed_queue: str
-    last_run: datetime.datetime
-    running_queue: str
     should_run: bool
+    is_leader: bool
 
     def __init__(self, redis: Redis, jobs: list[JobModule], workflow_directory: str = None, **kwargs):
         self.id = str(uuid4())
-        self.scheduled_queue = 'nuts|jobs|scheduled'
-        self.running_queue = 'nuts|jobs|running'
-        self.pending_queue = 'nuts|jobs|pending'
-        self.completed_queue = 'nuts|jobs|completed'
+
+        # Cron/delay due-time tracking.
+        self.scheduled_queue = 'nuts|jobs|scheduled'                 # bare cron job names, deduped by name
+        self.scheduled_workflow_queue = 'nuts|workflows|scheduled'   # bare workflow template names, deduped by name
+        self.delayed_queue = 'nuts|jobs|delayed'                     # anonymous JSON payloads (WorkQueue delay_seconds)
+        self.retry_queue = 'nuts|retry|pending'                      # anonymous JSON payloads (backoff-pending retries)
         self.cancel_queue = 'nuts|jobs|cancel'
-        self.scheduled_workflow_queue = 'nuts|workflows|scheduled'
-        self.running_workflow_queue = 'nuts|workflows|running'
-        self.completed_workflow_queue = 'nuts|workflows|completed'
+
+        self.consumer_group = kwargs.pop('consumer_group', 'nuts|workers')
+        self.pel_min_idle_ms = kwargs.pop('pel_min_idle_ms', 60000)
+        self.instance_ttl_seconds = kwargs.pop('instance_ttl_seconds', 604800)
+        self.concurrency_lease_seconds = kwargs.pop('concurrency_lease_seconds', 300)
+        self.retry_policy = kwargs.pop('retry_policy', RetryPolicy())
+
         self.kwargs = kwargs
         self.should_run = True
         self.is_leader = False
@@ -51,8 +75,8 @@ class Worker():
         self.last_run = datetime.datetime.fromtimestamp(0)
 
         self.redis = redis
-
         self.scheduler = Cron()
+        self.concurrency = ConcurrencyGate(redis)
 
         self.logger = logging.getLogger(f'worker|{self.id}')
         logging.basicConfig(
@@ -61,83 +85,85 @@ class Worker():
             datefmt="%Y-%m-%d %H:%M:%S",
         )
 
-        self.jobs = []
-        self.workflows = []
+        self.registry = JobRegistry(jobs)
+        self.workflow_templates = []
+
+        self._ensure_consumer_groups()
 
         self.check_leader()
 
         if self.is_leader and workflow_directory:
-            self.logger.info(f'Worker {self.id} assuming leadership')
-            # Register the workflows
-            print(os.listdir(workflow_directory))
-            for workflow in os.listdir(workflow_directory):
-                if not workflow.endswith('.yaml'):
-                    continue
-                with open(os.path.join(workflow_directory, workflow), 'r') as f:
-                    wf = yaml.safe_load(f)
-                    self.logger.info(f'Registering Workflow {workflow}')
+            self._load_workflow_templates(workflow_directory)
 
-                    workflow = NutsWorkflow(**wf['workflow'])
+        if self.is_leader:
+            self._register_cron_jobs()
 
-                    # Validate workflow configuration
-                    is_valid, error = workflow.validate()
-                    if not is_valid:
-                        self.logger.error(f'Invalid workflow {workflow.name}: {error}')
-                        continue
+    def _ensure_consumer_groups(self):
+        for priority in dispatch.PRIORITIES:
+            self._ensure_group(dispatch.stream_key(priority))
 
-                    self.workflows.append(workflow)
+    def _ensure_group(self, stream_key: str):
+        try:
+            self.redis.xgroup_create(stream_key, self.consumer_group, id='0', mkstream=True)
+        except Exception as ex:
+            if 'BUSYGROUP' not in str(ex):
+                raise
 
-                    next_execution = self.scheduler.get_next_execution(workflow.schedule)
-                    next_execution = next_execution.timestamp()
-                    running_workflow = None
-                    try:
-                        pending = self.redis.zscan(self.scheduled_workflow_queue, match=workflow.name)
-                        if pending[1]:
-                            if pending[1][0][1] != next_execution:
-                                # Schedule has changed
-                                self.redis.zrem(self.scheduled_workflow_queue, workflow.name)
-                                self.redis.zadd(self.scheduled_workflow_queue, {workflow.name: next_execution})
+    def _load_workflow_templates(self, workflow_directory: str):
+        self.logger.info(f'Worker {self.id} assuming leadership')
+        for filename in os.listdir(workflow_directory):
+            if not filename.endswith('.yaml'):
+                continue
+            with open(os.path.join(workflow_directory, filename), 'r') as f:
+                raw = yaml.safe_load(f)
 
-                    except Exception:
-                        pass
+            self.logger.info(f'Registering Workflow {filename}')
+            template = NutsWorkflow(**raw['workflow'])
 
-                    running_workflow = self.redis.hget(self.running_workflow_queue, workflow.name)
+            is_valid, error = template.validate()
+            if not is_valid:
+                self.logger.error(f'Invalid workflow {template.name}: {error}')
+                continue
 
-                    if not running_workflow:
-                        self.redis.zadd(self.scheduled_workflow_queue, {workflow.name: next_execution})
-                    else:
-                        print(running_workflow)
-                        # Type guard: running_workflow is bytes here (not None)
-                        assert isinstance(running_workflow, bytes)
-                        workflow = NutsWorkflow(**json.loads(running_workflow))
+            self.workflow_templates.append(template)
+            next_execution = self.scheduler.get_next_execution(template.schedule).timestamp()
+            self._register_recurring(self.scheduled_workflow_queue, template.name, next_execution)
 
-        # Register jobs with the worker
-        for job in jobs:
-            j = job.Job()
+    def _register_cron_jobs(self):
+        for definition in self.registry.definitions():
+            if not definition.schedule:
+                continue
+            self.logger.info(f'Registering Cron Job {definition.name}')
+            next_execution = self.scheduler.get_next_execution(definition.schedule).timestamp()
+            self._register_recurring(self.scheduled_queue, definition.name, next_execution)
 
-            self.jobs.append(j)
+    def _register_recurring(self, zset_key: str, name: str, next_due_ts: float):
+        '''
+            Seed/update a bare-name due-time entry, deduping on name so a
+            worker restart doesn't pile up duplicate entries or drift the
+            next-fire time away from a freshly computed value.
+        '''
+        already_scheduled = False
+        try:
+            pending = self.redis.zscan(zset_key, match=name)
+            if pending[1]:
+                already_scheduled = True
+                if pending[1][0][1] != next_due_ts:
+                    self.redis.zrem(zset_key, name)
+                    self.redis.zadd(zset_key, {name: next_due_ts})
+        except Exception:
+            pass
 
-            # If this worker is the leader, register the job schedules
-            if self.is_leader and j.schedule:
-                self.logger.info(f'Registering Cron Job {j.name}')
+        if not already_scheduled:
+            self.redis.zadd(zset_key, {name: next_due_ts})
 
-                next_execution = self.scheduler.get_next_execution(j.schedule).timestamp()
-
-                already_scheduled = False
-                try:
-                    pending = self.redis.zscan(self.scheduled_queue, match=j.name)
-                    if pending[1]:
-                        already_scheduled = True
-                        if pending[1][0][1] != next_execution:
-                            # Schedule has changed
-                            self.redis.zrem(self.scheduled_queue, j.name)
-                            self.redis.zadd(self.scheduled_queue, {j.name: next_execution})
-
-                except Exception:
-                    pass
-
-                if not already_scheduled:
-                    self.redis.zadd(self.scheduled_queue, {j.name: next_execution})
+    def _due_names(self, zset_key: str, now_ts: float) -> list[str]:
+        candidates = self.redis.zrange(zset_key, start=0, end=now_ts, byscore=True)
+        names = []
+        for member in candidates:
+            if self.redis.zrem(zset_key, member):
+                names.append(member.decode())
+        return names
 
     def check_leader(self) -> bool:
         leadership_check = self.redis.setnx('leader_id', self.id)
@@ -160,21 +186,12 @@ class Worker():
     def shutdown(self, signum, frame):
         self.logger.info(f'Received shutdown command {signum}.')
         self.should_run = False
-
-        if self.is_leader:
-            for workflow in self.workflows:
-                if workflow.status == 'active':
-                    self.logger.info(f'Workflow {workflow.name} is active, persisting state')
-                    self.redis.hset(self.running_workflow_queue, workflow.name, json.dumps(workflow, default=lambda o: o.__dict__))
-            self.release_leader()
+        self.release_leader()
 
     def release_leader(self):
         if self.is_leader:
             self.logger.info('Shutdown: Releasing leadership')
             self.redis.expire('leader_id', -1)
-
-    def schedule_pending_job(self, job_name, job_params=[]):
-        self.redis.sadd(self.pending_queue, json.dumps([job_name, job_params]))
 
     def is_job_cancelled(self, job_name: str) -> bool:
         """Check if a cancellation has been requested for this job."""
@@ -184,213 +201,268 @@ class Worker():
         """Clear the cancellation flag for a job."""
         self.redis.srem(self.cancel_queue, job_name)
 
-    def move_scheduled_to_pending(self):
-        now = datetime.datetime.now(datetime.timezone.utc)
-        now_timestamp = round(now.timestamp())
+    # ---- Leader-only: sole producer into the priority streams and DLQ ----
 
-        ready_jobs = self.redis.zrange(self.scheduled_queue, start=0, end=now_timestamp, byscore=True, withscores=True)
+    def drain_due_cron_jobs(self):
+        now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+        for name in self._due_names(self.scheduled_queue, now):
+            definition = self.registry.get(name)
+            if definition is None:
+                continue
+            payload = dispatch.build_payload(name, {}, priority='normal', max_attempts=definition.max_attempts)
+            dispatch.enqueue_payload(self.redis, payload)
 
-        if len(ready_jobs) > 0:
-            latest = max(j[1] for j in ready_jobs)
-            self.redis.zremrangebyscore(self.scheduled_queue, min=self.last_run.timestamp(), max=latest)
+    def drain_due_delayed_jobs(self):
+        now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+        for payload in dispatch.due_items(self.redis, self.delayed_queue, now):
+            self._dispatch_or_requeue(payload, self.delayed_queue)
 
-            for job in ready_jobs:
-                self.schedule_pending_job(job[0].decode())
+    def drain_due_retries(self):
+        now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+        for payload in dispatch.due_items(self.redis, self.retry_queue, now):
+            self._dispatch_or_requeue(payload, self.retry_queue)
 
-    def move_scheduled_workflows_to_running(self):
-        now = datetime.datetime.now(datetime.timezone.utc)
-        now_timestamp = round(now.timestamp())
+    def _dispatch_or_requeue(self, payload: dict, zset_key: str):
+        key = payload.get('concurrency_key')
+        if key:
+            holder = self._holder_token(payload)
+            if not self.concurrency.acquire(key, holder, payload.get('concurrency_limit', 1), self.concurrency_lease_seconds):
+                # No slot free yet -- put it straight back, the next tick's
+                # due_items() call will pick it up and retry the check.
+                now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+                dispatch.dispatch_later(self.redis, zset_key, payload, now)
+                return
+        dispatch.enqueue_payload(self.redis, payload)
 
-        ready_workflows = self.redis.zrange(self.scheduled_workflow_queue, start=0, end=now_timestamp, byscore=True, withscores=True)
+    def drain_due_workflow_cron(self):
+        now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+        for name in self._due_names(self.scheduled_workflow_queue, now):
+            template = next((t for t in self.workflow_templates if t.name == name), None)
+            if template is None:
+                continue
+            # Reschedule at drain time, not completion -- overlapping
+            # instances of the same template are allowed by design, since
+            # concurrent instances are the whole point of this redesign.
+            instance.create_instance(self.redis, template.name, template.to_plan())
+            next_execution = self.scheduler.get_next_execution(template.schedule).timestamp()
+            self._register_recurring(self.scheduled_workflow_queue, template.name, next_execution)
 
-        if len(ready_workflows) > 0:
-            latest = max(j[1] for j in ready_workflows)
-            self.redis.zremrangebyscore(self.scheduled_workflow_queue, min=self.last_run.timestamp(), max=latest)
+    def sweep_active_workflow_instances(self):
+        for raw_id in self.redis.smembers(instance.ACTIVE_SET):
+            instance_id = raw_id.decode()
+            doc = instance.get_instance(self.redis, instance_id)
+            if doc is None:
+                self.redis.srem(instance.ACTIVE_SET, raw_id)
+                continue
 
-        for workflow in ready_workflows:
-            wf_name = workflow[0].decode()
-            wf = [w for w in self.workflows if w.name == wf_name][0]
+            instance.resolve_wait_steps(self.redis, instance_id)
+            doc = instance.get_instance(self.redis, instance_id)
+            if doc is None:
+                continue
 
-            wf.status = 'active'
+            for step in instance.ready_steps(doc):
+                if step['kind'] != 'job':
+                    continue
 
-    def move_pending_to_running(self, job: NutsJob, job_args: list):
-        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        self.redis.hset(self.running_queue, f'{self.id}|{job.name}', json.dumps({'timestamp': now, 'args': job_args}))
-
-    def remove_running(self, job: NutsJob):
-
-        self.redis.hdel(self.running_queue, f'{self.id}|{job.name}')
-
-    def move_to_completed(self, job: NutsJob, workflow_name: str = None):
-        if workflow_name:
-            name = f'{workflow_name}|{job.name}'
-        else:
-            name = job.name
-
-        job_data = {'success': job.success}
-        if hasattr(job, 'error') and job.error:
-            job_data['error'] = str(job.error)
-
-        self.redis.hset(self.completed_queue, name, json.dumps(job_data))
-
-    def queue_completed_jobs(self):
-
-        completed_jobs = self.redis.hkeys(self.completed_queue)
-
-        for job_name in completed_jobs:
-            job_results_raw = self.redis.hget(self.completed_queue, job_name)
-            if not job_results_raw:
-                continue  # Skip if no results found
-            # Type guard: job_results_raw is bytes here (not None)
-            assert isinstance(job_results_raw, bytes)
-            job_results = json.loads(job_results_raw)
-            status = 'completed' if job_results.get('success', None) else 'failed'
-            # Remove from the completed queue
-            self.redis.hdel(self.completed_queue, job_name)
-
-            if 'workflow' in job_name.decode():
-                [workflow_name, job_name] = job_name.decode().split('|')
-                workflow_name = workflow_name.replace('workflow-', '')
-                wf = [w for w in self.workflows if w.name == workflow_name][0]
-
-                # Pass error information if job failed
-                error_msg = job_results.get('error', None) if status == 'failed' else None
-                wf.update(job_name, status, error_msg)
-
-            else:
-                job = [j for j in self.jobs if j.name == job_name.decode()][0]
-
-                next_execution = self.scheduler.get_next_execution(job.schedule).timestamp()
-
-                self.redis.zadd(self.scheduled_queue, {job.name: next_execution})
-
-    def run_workflows(self):
-        """
-        Execute active workflows by checking dependencies and scheduling ready jobs.
-
-        This method:
-        - Moves scheduled workflows to running state
-        - Checks for job failures (stops workflow if any job failed)
-        - Identifies next ready job based on dependencies
-        - Schedules ready jobs to pending queue
-        - Reschedules completed/failed workflows for next run
-
-        Workflows are executed by the leader worker only.
-        """
-        # Move ready  to the pending queue
-        self.move_scheduled_workflows_to_running()
-
-        try:
-            for workflow in self.workflows:
-                if workflow.status in ('active', 'failed'):
-                    self.logger.info(f'Running workflow {workflow.name}')
-
-                    # Check for failures first
-                    if workflow.has_failures():
-                        self.logger.error(f'Workflow {workflow.name} failed: {workflow.error}')
-                        workflow.status = 'failed'
-                        # Reschedule for next run
-                        workflow.reset()
-                        next_execution = self.scheduler.get_next_execution(workflow.schedule).timestamp()
-                        self.redis.zadd(self.scheduled_workflow_queue, {workflow.name: next_execution})
+                if step['concurrency_key']:
+                    holder = f"{instance_id}:{step['step_id']}"
+                    if not self.concurrency.acquire(step['concurrency_key'], holder, step['concurrency_limit'], self.concurrency_lease_seconds):
                         continue
 
-                    try:
-                        next_job = workflow.run()
-                        if not next_job and workflow.completed():
-                            self.logger.info(f'Workflow {workflow.name} completed successfully')
-                            workflow.reset()
-                            next_execution = self.scheduler.get_next_execution(workflow.schedule).timestamp()
-                            print(self.scheduler.get_next_execution(workflow.schedule), datetime.datetime.now(datetime.timezone.utc))
-                            self.redis.zadd(self.scheduled_workflow_queue, {workflow.name: next_execution})
-                        elif next_job:
-                            self.logger.info(f'Workflow {workflow.name} next job {next_job}')
+                definition = self.registry.get(step['op'])
+                max_attempts = step['max_attempts']
+                if max_attempts is None:
+                    max_attempts = definition.max_attempts if definition else NutsJob.max_attempts
 
-                            self.schedule_pending_job(f'workflow-{workflow.name}|{next_job}')
-                            workflow.update(next_job, 'pending')
+                payload = dispatch.build_payload(
+                    step['op'],
+                    self._step_params(doc, step),
+                    priority=step['priority'],
+                    max_attempts=max_attempts,
+                    instance_id=instance_id,
+                    step_id=step['step_id'],
+                    concurrency_key=step['concurrency_key'],
+                    concurrency_limit=step['concurrency_limit'],
+                )
+                dispatch.enqueue_payload(self.redis, payload)
+                self._mark_step(instance_id, step['step_id'], status='dispatched')
 
-                    except Exception as ex:
-                        # Deal with user error gracefully
-                        self.logger.error(f'Unhandled Exception In Workflow: {workflow.name}: {ex}')
-                        workflow.status = 'failed'
-                        workflow.error = str(ex)
-                        workflow.reset()
-                        next_execution = self.scheduler.get_next_execution(workflow.schedule).timestamp()
-                        self.redis.zadd(self.scheduled_workflow_queue, {workflow.name: next_execution})
+            doc = instance.get_instance(self.redis, instance_id)
+            if doc is None:
+                continue
+            statuses = [s['status'] for s in doc['steps']]
+            if all(s == 'completed' for s in statuses):
+                instance.complete_instance(self.redis, instance_id, self.instance_ttl_seconds)
+            elif 'failed' in statuses:
+                instance.fail_instance(self.redis, instance_id, self.instance_ttl_seconds, error=doc.get('error'))
 
+    def _step_params(self, doc: dict, step: dict) -> dict:
+        '''
+            Merge instance-level params with each completed prerequisite
+            step's result, keyed by that step's step_id -- gives a step
+            access to upstream results via **kwargs without a special
+            naming convention.
+        '''
+        params = dict(doc.get('params') or {})
+        for req in (step.get('requires') or []):
+            req_step = next((s for s in doc['steps'] if s['step_id'] == req), None)
+            if req_step is not None:
+                params[req] = req_step.get('result')
+        return params
+
+    def _mark_step(self, instance_id: str, step_id: str, **fields):
+        def mutate(doc):
+            step = next(s for s in doc['steps'] if s['step_id'] == step_id)
+            step.update(fields)
+        try:
+            instance.update_instance(self.redis, instance_id, mutate)
+        except KeyError:
+            self.logger.error(f'Instance {instance_id} missing while updating step {step_id}')
+
+    def reclaim_stale_pel_entries(self):
+        for priority in dispatch.PRIORITIES:
+            stream = dispatch.stream_key(priority)
+            try:
+                _, claimed, _ = self.redis.xautoclaim(
+                    stream, self.consumer_group, self.id,
+                    min_idle_time=self.pel_min_idle_ms, start_id='0-0', count=50,
+                )
+            except Exception as ex:
+                self.logger.error(f'Unhandled Exception reclaiming PEL for {stream}: {ex}')
+                continue
+
+            for entry_id, fields in claimed:
+                raw = fields.get(b'data', fields.get('data'))
+                try:
+                    payload = json.loads(raw)
+                except Exception:
+                    self.redis.xack(stream, self.consumer_group, entry_id)
+                    continue
+
+                attempt = payload.get('attempt', 1)
+                max_attempts = payload.get('max_attempts', self.retry_policy.max_attempts)
+                self.redis.xack(stream, self.consumer_group, entry_id)
+
+                if attempt >= max_attempts:
+                    message = 'Reclaimed from a crashed worker; retries exhausted'
+                    dispatch.to_dlq(self.redis, payload, message)
+                    if payload.get('instance_id'):
+                        self._mark_step(payload['instance_id'], payload['step_id'], status='failed', error=message)
+                else:
+                    bumped = dict(payload, attempt=attempt + 1)
+                    dispatch.enqueue_payload(self.redis, bumped)
+
+    # ---- Every worker, leader or not: the consumer side ----
+
+    def consume_one(self):
+        for priority in dispatch.PRIORITIES:
+            stream = dispatch.stream_key(priority)
+            response = self.redis.xreadgroup(self.consumer_group, self.id, {stream: '>'}, count=1)
+            if not response:
+                continue
+            _, messages = response[0]
+            if not messages:
+                continue
+            entry_id, fields = messages[0]
+            self._process_entry(stream, entry_id, fields)
+            return
+
+    def _process_entry(self, stream: str, entry_id, fields: dict):
+        raw = fields.get(b'data', fields.get('data'))
+        payload = json.loads(raw)
+        job_name = payload['job_name']
+
+        def ack_and_release():
+            self.redis.xack(stream, self.consumer_group, entry_id)
+            if payload.get('concurrency_key'):
+                self.concurrency.release(payload['concurrency_key'], self._holder_token(payload))
+
+        if self.is_job_cancelled(job_name):
+            self.logger.info(f'Job {job_name} was cancelled, skipping execution')
+            self.clear_job_cancellation(job_name)
+            ack_and_release()
+            return
+
+        if job_name not in self.registry:
+            self.logger.error(f'No job matches name {job_name}')
+            ack_and_release()
+            self._handle_failure(payload, f'Unknown job: {job_name}')
+            return
+
+        job = self.registry.new(job_name)
+        try:
+            params = payload.get('params')
+            if isinstance(params, dict):
+                job.run(**params, **self.kwargs)
+            else:
+                # For backwards compatibility or empty args
+                job.run(**self.kwargs)
         except Exception as ex:
-            self.logger.error(f'Unhandled Exception in run_workflows: {ex}')
+            # Deal with user error gracefully
+            self.logger.error(f'Unhandled Exception In Job: {job_name}: {ex}')
+            job.success = False
+            job.error = ex
+
+        ack_and_release()
+
+        if job.success:
+            self.logger.info(f'SUCCESS: {job_name}, {job.result}')
+            if payload.get('instance_id'):
+                self._mark_step(payload['instance_id'], payload['step_id'], status='completed', result=job.result)
+            elif job.next:
+                # Light DAG support: chain to the next job using this job's result as params.
+                dispatch.dispatch_now(self.redis, job.next, job.result)
+            if job.schedule:
+                self._reschedule_cron(job_name, job.schedule)
+        else:
+            self.logger.error(f'Error running job {job_name}: {job.error}')
+            self._handle_failure(payload, str(job.error) if job.error else 'Unknown error')
+            if job.schedule:
+                self._reschedule_cron(job_name, job.schedule)
+
+        self.last_run = datetime.datetime.now(datetime.timezone.utc)
+
+    def _handle_failure(self, payload: dict, error_message: str):
+        attempt = payload.get('attempt', 1)
+        max_attempts = payload.get('max_attempts', self.retry_policy.max_attempts)
+
+        if attempt >= max_attempts:
+            self.logger.error(f"{payload['job_name']} exhausted retries, sending to DLQ")
+            dispatch.to_dlq(self.redis, payload, error_message)
+            if payload.get('instance_id'):
+                self._mark_step(payload['instance_id'], payload['step_id'], status='failed', error=error_message)
+        else:
+            bumped = dict(payload, attempt=attempt + 1)
+            delay = self.retry_policy.delay(attempt)
+            due_ts = datetime.datetime.now(datetime.timezone.utc).timestamp() + delay
+            self.logger.info(f"Retrying {payload['job_name']} (attempt {attempt + 1}/{max_attempts}) in {delay:.1f}s")
+            dispatch.dispatch_later(self.redis, self.retry_queue, bumped, due_ts)
+
+    def _reschedule_cron(self, job_name: str, schedule: str):
+        next_execution = self.scheduler.get_next_execution(schedule).timestamp()
+        self.redis.zadd(self.scheduled_queue, {job_name: next_execution})
+
+    def _holder_token(self, payload: dict) -> str:
+        if payload.get('instance_id'):
+            return f"{payload['instance_id']}:{payload['step_id']}"
+        return f"{payload['job_name']}:{payload.get('created_at')}"
 
     def run(self):
         # Check that we have a leader each time this runs so we don't leave any jobs in limbo if the leader has gone down
         self.check_leader()
 
         if self.is_leader:
-            # Move ready jobs to the pending queue
-            self.move_scheduled_to_pending()
-            self.run_workflows()
+            try:
+                self.drain_due_cron_jobs()
+                self.drain_due_delayed_jobs()
+                self.drain_due_retries()
+                self.drain_due_workflow_cron()
+                self.sweep_active_workflow_instances()
+                self.reclaim_stale_pel_entries()
+            except Exception as ex:
+                self.logger.error(f'Unhandled Exception in leader tick: {ex}')
 
         try:
-            data = self.redis.spop(self.pending_queue, 1)
-            if not len(data):
-                return
-            else:
-                # Type guard: data[0] is bytes (from redis)
-                assert isinstance(data[0], bytes)
-                [job_name, job_args] = json.loads(data[0])
-                for_workflow = False
-                workflow_name = None
-                if 'workflow' in job_name:
-                    for_workflow = True
-                    [workflow_name, job_name] = job_name.split('|')
-
-                jobs = [j for j in self.jobs if j.name == job_name]
-
-                if not len(jobs):
-                    self.logger.info(f'No job matches name {job_name}')
-                    return
-                else:
-                    job = jobs[0]
-
-                    # Check if cancellation was requested for this job
-                    if self.is_job_cancelled(job_name):
-                        self.logger.info(f'Job {job_name} was cancelled, skipping execution')
-                        self.clear_job_cancellation(job_name)
-                        return
-
-                    self.move_pending_to_running(job, job_args)
-
-                    try:
-                        # Handle both dict arguments and backwards compatibility
-                        if isinstance(job_args, dict):
-                            job.run(**job_args, **self.kwargs)
-                        else:
-                            # For backwards compatibility or empty args
-                            job.run(**self.kwargs)
-                    except Exception as ex:
-                        # Deal with user error gracefully
-                        self.logger.error(f'Unhandled Exception In Job: {job.name}: {ex}')
-
-                    self.remove_running(job)
-
-                    if job.success:
-                        self.logger.info(f'SUCCESS: {job.name}, {job.result}')
-                        # Light DAG support, can chain together jobs in a workflow by defining the next step that should
-                        # be taken after a job completes
-                        if job.next:
-                            self.schedule_pending_job(job.next, job.result)
-
-                    else:
-                        self.logger.error(f'Error running job {job.name}: {job.error}')
-
-                    if job.schedule or for_workflow:
-                        self.move_to_completed(job, workflow_name)
-
-                self.last_run = datetime.datetime.now(datetime.timezone.utc)
-
+            self.consume_one()
         except Exception as ex:
             self.logger.error(f'Unhandled Exception in worker run process: {ex}')
-
-        # Post Execution
-        if self.is_leader:
-            self.queue_completed_jobs()
