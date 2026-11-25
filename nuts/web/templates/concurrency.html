@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% from "_macros.html" import short with context %}
+{% block content %}
+<h1>Concurrency</h1>
+<p class="muted">Keys with a running holder or a line of waiting jobs. A holder whose lease runs out without a heartbeat is treated as gone.</p>
+{% if rows %}
+<table>
+<tr><th>Key</th><th>Running</th><th>Waiting</th><th>Holders (lease left)</th></tr>
+{% for row in rows %}
+<tr><td class="mono">{{ row.key }}</td><td>{{ row.holders | length }}</td><td class="{{ 'warn' if row.waiting }}">{{ row.waiting }}</td>
+<td>{% for h in row.holders %}{{ short(h.dispatch_id) }} <span class="muted">{{ h.lease_seconds_left }}s</span>{% if not loop.last %}, {% endif %}{% endfor %}</td></tr>
+{% endfor %}</table>
+{% else %}<p class="empty">No keys in use.</p>{% endif %}
+{% endblock %}

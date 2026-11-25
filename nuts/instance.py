@@ -28,6 +28,8 @@ WAIT_DEADLINES = 'nuts|workflows|wait_deadlines'
 INSTANCE_KEY_PREFIX = 'nuts|workflows|instance|'
 SIGNAL_KEY_PREFIX = 'nuts|workflows|signals|'
 ENTITY_KEY_PREFIX = 'nuts|workflows|entity|'
+RECENT_FINISHED = 'nuts|workflows|recent'
+RECENT_FINISHED_LENGTH = 1000
 WAITING_PREFIX = 'waiting_for:'
 DEFAULT_TTL_SECONDS = 604800
 FINISHED_STATUSES = ('completed', 'failed', 'cancelled')
@@ -199,6 +201,9 @@ def _finish(redis: Redis, instance_id: str, status: str, ttl_seconds: int, error
     pipe = redis.pipeline()
     pipe.srem(ACTIVE_SET, instance_id)
     pipe.zrem(WAIT_DEADLINES, instance_id)
+    pipe.lrem(RECENT_FINISHED, 0, instance_id)
+    pipe.lpush(RECENT_FINISHED, instance_id)
+    pipe.ltrim(RECENT_FINISHED, 0, RECENT_FINISHED_LENGTH - 1)
     pipe.expire(instance_key(instance_id), ttl_seconds)
     pipe.expire(signal_key(instance_id), ttl_seconds)
     pipe.execute()

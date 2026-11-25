@@ -1,0 +1,18 @@
+{% macro status(value) -%}
+{%- set v = value or 'pending' -%}
+{%- if v in ('completed', 'succeeded') %}<span class="badge ok">{{ v }}</span>
+{%- elif v in ('failed', 'dead') %}<span class="badge bad">{{ v }}</span>
+{%- elif v in ('retrying', 'reclaimed', 'cancelled') %}<span class="badge warn">{{ v }}</span>
+{%- elif v.startswith('waiting_for:') %}<span class="badge info">{{ v }}</span>
+{%- else %}<span class="badge muted">{{ v }}</span>{% endif -%}
+{%- endmacro %}
+
+{% macro when(ts) -%}<span title="{{ ts | iso }}">{{ ts | ago }}</span>{%- endmacro %}
+
+{% macro params(value) -%}
+{%- if value %}<details><summary class="mono">{{ value | compact(80) }}</summary><pre>{{ value | pretty }}</pre></details>{% else %}<span class="muted">—</span>{% endif -%}
+{%- endmacro %}
+
+{% macro short(id) -%}<span class="mono" title="{{ id }}">{{ (id or '')[:10] }}</span>{%- endmacro %}
+
+{% macro instance_link(id) -%}{% if id %}<a class="mono" href="{{ url_for('instance', instance_id=id) }}" title="{{ id }}">{{ id[:8] }}</a>{% endif %}{%- endmacro %}

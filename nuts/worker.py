@@ -103,6 +103,8 @@ class Worker():
         self.leader_interval_seconds = kwargs.pop('leader_interval_seconds', 1.0)
         self.leader_ttl_seconds = kwargs.pop('leader_ttl_seconds', 60)
         self.full_sweep_interval_seconds = kwargs.pop('full_sweep_interval_seconds', 300)
+        self.history_length = kwargs.pop('history_length', 1000)
+        self.consumer_prune_after_ms = kwargs.pop('consumer_prune_after_ms', 3600000)
         self.leader_tick_budget_seconds = kwargs.pop('leader_tick_budget_seconds', 5.0)
         self.heartbeat_interval_seconds = kwargs.pop(
             'heartbeat_interval_seconds', max(0.01, self.pel_min_idle_ms / 1000 / 3)
@@ -237,6 +239,7 @@ class Worker():
         ]
         if time.monotonic() - self._last_full_sweep >= self.full_sweep_interval_seconds:
             steps.append(self.sweep_active_workflow_instances)
+            steps.append(self.prune_idle_consumers)
         for step in steps:
             if not self.is_leader:
                 return
@@ -398,6 +401,14 @@ class Worker():
         for key in self.concurrency.waiting_keys():
             self.concurrency.pump(key, self.concurrency_lease_seconds)
 
+    def prune_idle_consumers(self):
+        '''Every worker joins the consumer group under its own id; drop ids of workers long gone so the group doesn't grow forever.'''
+        for priority in dispatch.PRIORITIES:
+            stream = dispatch.stream_key(priority)
+            for consumer in self.redis.xinfo_consumers(stream, self.consumer_group):
+                if consumer['pending'] == 0 and consumer['idle'] > self.consumer_prune_after_ms:
+                    self.redis.xgroup_delconsumer(stream, self.consumer_group, consumer['name'])
+
     def reclaim_stale_pel_entries(self):
         for priority in dispatch.PRIORITIES:
             stream = dispatch.stream_key(priority)
@@ -421,8 +432,11 @@ class Worker():
                 attempt = payload.get('attempt', 1)
                 max_attempts = payload.get('max_attempts', self.retry_policy.max_attempts)
                 if attempt >= max_attempts:
-                    self._give_up(payload, 'Reclaimed from a stalled or crashed worker; retries exhausted')
+                    message = 'Reclaimed from a stalled or crashed worker; retries exhausted'
+                    self._record(payload, 'dead', error=message)
+                    self._give_up(payload, message)
                 else:
+                    self._record(payload, 'reclaimed', error='Reclaimed from a stalled or crashed worker')
                     dispatch.enqueue_payload(self.redis, dict(payload, attempt=attempt + 1))
                 dispatch.ack(self.redis, stream, self.consumer_group, entry_id)
 
@@ -493,6 +507,7 @@ class Worker():
         try:
             if self._is_cancelled(payload):
                 self.logger.info(f'Job {job_name} ({holder}) was cancelled, skipping execution')
+                self._record(payload, 'cancelled')
                 if payload.get('batch'):
                     batch.done(self.redis, payload)
                 claim.holds_slot = bool(key)  # it may have been handed a slot while parked
@@ -547,7 +562,7 @@ class Worker():
         job_name = payload['job_name']
         job = self._new_job(job_name)
         if job is None:
-            self._handle_failure(payload, f'Unknown job: {job_name}')
+            self._handle_failure(payload, f'Unknown job: {job_name}', started=claim.started_at)
             return
 
         params = payload.get('params')
@@ -555,13 +570,14 @@ class Worker():
 
         if job.success:
             self.logger.info(f'SUCCESS: {job_name}, {job.result}')
+            self._record(payload, 'succeeded', started=claim.started_at)
             if payload.get('instance_id'):
                 self._mark_step(payload['instance_id'], payload['step_id'], status='completed', result=job.result)
             elif job.next:
                 dispatch.dispatch_now(self.redis, job.next, job.result)
         else:
             self.logger.error(f'Error running job {job_name}: {job.error}')
-            self._handle_failure(payload, str(job.error) if job.error else 'Unknown error')
+            self._handle_failure(payload, str(job.error) if job.error else 'Unknown error', started=claim.started_at)
 
         if job.schedule:
             self._reschedule_cron(job_name, job.schedule)
@@ -579,16 +595,19 @@ class Worker():
 
         job = self._new_job(job_name)
         if job is None:
-            self._handle_failure(payload, f'Unknown job: {job_name}')
+            self._handle_failure(payload, f'Unknown job: {job_name}', started=claim.started_at)
             return
 
         self._call(job, job_name, {'items': [i['params'] for i in items]})
         if not job.success:
             self.logger.error(f'Error running batch {job_name}: {job.error}')
-            self._handle_failure(payload, str(job.error) if job.error else 'Unknown error')
+            self._handle_failure(payload, str(job.error) if job.error else 'Unknown error', started=claim.started_at)
             return
 
         self.logger.info(f'SUCCESS: {job_name} batch of {len(items)}')
+        failed_count = len(job.failed_items or {})
+        self._record(payload, 'succeeded', started=claim.started_at,
+                     items=len(items), failed_items=failed_count)
         retry = []
         for index, error in (job.failed_items or {}).items():
             item = dict(items[index], attempt=items[index].get('attempt', 1) + 1)
@@ -604,26 +623,53 @@ class Worker():
 
     def _item_to_dlq(self, flush: dict, item: dict, error: str):
         dispatch.to_dlq(self.redis, {
+            'kind': 'batch_item',
             'job_name': flush['job_name'],
             'params': item['params'],
             'item_id': item['item_id'],
             'attempt': item['attempt'],
+            'max_attempts': flush.get('max_attempts'),
             'priority': flush['priority'],
             'batch_key': flush['batch'].get('batch_key'),
+            'batch': flush['batch'],
+            'concurrency_key': flush.get('concurrency_key'),
+            'concurrency_limit': flush.get('concurrency_limit', 1),
         }, error)
 
-    def _handle_failure(self, payload: dict, error_message: str):
+    def _handle_failure(self, payload: dict, error_message: str, started: Union[float, None] = None):
         attempt = payload.get('attempt', 1)
         max_attempts = payload.get('max_attempts', self.retry_policy.max_attempts)
 
         if attempt >= max_attempts:
             self.logger.error(f"{payload['job_name']} exhausted retries, sending to DLQ")
+            self._record(payload, 'dead', error=error_message, started=started)
             self._give_up(payload, error_message)
         else:
+            self._record(payload, 'retrying', error=error_message, started=started)
             bumped = dict(payload, attempt=attempt + 1)
             delay = self.retry_policy.delay(attempt)
             self.logger.info(f"Retrying {payload['job_name']} (attempt {attempt + 1}/{max_attempts}) in {delay:.1f}s")
             dispatch.dispatch_later(self.redis, self.retry_queue, bumped, _now_ts() + delay)
+
+    def _record(self, payload: dict, outcome: str, error: Union[str, None] = None,
+                started: Union[float, None] = None, **extra):
+        try:
+            dispatch.record_history(self.redis, {
+                'dispatch_id': payload.get('dispatch_id'),
+                'job_name': payload.get('job_name'),
+                'outcome': outcome,
+                'error': error,
+                'attempt': payload.get('attempt', 1),
+                'priority': payload.get('priority'),
+                'instance_id': payload.get('instance_id'),
+                'step_id': payload.get('step_id'),
+                'worker_id': self.id,
+                'finished_at': _now_ts(),
+                'duration_seconds': round(time.monotonic() - started, 3) if started is not None else None,
+                **extra,
+            }, self.history_length)
+        except Exception as ex:
+            self.logger.error(f'Could not record history: {ex}')
 
     def _give_up(self, payload: dict, error: str):
         if payload.get('batch'):

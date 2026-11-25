@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% from "_macros.html" import when, params, short, instance_link with context %}
+{% block content %}
+<h1>Jobs</h1>
+
+<form class="form" method="post" action="{{ url_for('publish') }}">
+  <label>Job name<input name="job_name" required></label>
+  <label>Params (JSON object)<textarea name="params" rows="1" cols="40" placeholder='{"sim": 1234}'></textarea></label>
+  <label>Priority<select name="priority">{% for p in priorities %}<option {{ 'selected' if p == 'normal' }}>{{ p }}</option>{% endfor %}</select></label>
+  <label>Delay (s)<input name="delay_seconds" type="number" min="0" step="any" value="0" style="width:80px"></label>
+  <button>Publish</button>
+</form>
+
+<h2>In flight ({{ in_flight | length }})</h2>
+{% if in_flight %}
+<div class="wrap"><table>
+<tr><th>Job</th><th>Priority</th><th>Params</th><th>Attempt</th><th>Worker</th><th>Held for</th><th>Deliveries</th><th>Step</th><th></th></tr>
+{% for j in in_flight %}
+<tr><td>{{ j.job_name }}{% if j.batch %} <span class="badge muted">batch</span>{% endif %}</td><td>{{ j.priority }}</td><td>{{ params(j.params) }}</td>
+<td>{{ j.attempt }}/{{ j.max_attempts }}</td><td>{{ short(j.worker_id) }}</td><td>{{ (j.idle_ms / 1000) | round(1) }}s since heartbeat</td><td>{{ j.deliveries }}</td>
+<td>{{ instance_link(j.instance_id) }} {{ j.step_id or '' }}</td>
+<td><form class="inline" method="post" action="{{ url_for('cancel_dispatch', dispatch_id=j.dispatch_id) }}"><button title="Skips future runs of this dispatch; a running job finishes">Cancel</button></form></td></tr>
+{% endfor %}</table></div>
+{% else %}<p class="empty">Nothing running.</p>{% endif %}
+
+<h2>Waiting for a concurrency slot ({{ parked | length }}{% if parked | length == 100 %}+{% endif %})</h2>
+{% if parked %}
+<div class="wrap"><table>
+<tr><th>Job</th><th>Priority</th><th>Key</th><th>Params</th><th>Attempt</th><th>Queued</th><th>Step</th><th>Dispatch</th><th></th></tr>
+{% for j in parked %}
+<tr><td>{{ j.job_name }}{% if j.batch %} <span class="badge muted">batch</span>{% endif %}</td><td>{{ j.priority }}</td>
+<td class="mono"><a href="{{ url_for('concurrency') }}">{{ j.waiting_on }}</a> ≤{{ j.concurrency_limit }}</td><td>{{ params(j.params) }}</td>
+<td>{{ j.attempt }}/{{ j.max_attempts }}</td><td>{{ when(j.created_at) }}</td><td>{{ instance_link(j.instance_id) }} {{ j.step_id or '' }}</td><td>{{ short(j.dispatch_id) }}</td>
+<td><form class="inline" method="post" action="{{ url_for('cancel_dispatch', dispatch_id=j.dispatch_id) }}"><button>Cancel</button></form></td></tr>
+{% endfor %}</table></div>
+{% else %}<p class="empty">None.</p>{% endif %}
+
+{% for p in priorities %}
+<h2>Queued: {{ p }} ({{ queued[p] | length }}{% if queued[p] | length == 100 %}+{% endif %})</h2>
+{% if queued[p] %}
+<div class="wrap"><table>
+<tr><th>Job</th><th>Params</th><th>Attempt</th><th>Concurrency</th><th>Queued</th><th>Step</th><th>Dispatch</th><th></th></tr>
+{% for j in queued[p] %}
+<tr><td>{{ j.job_name }}{% if j.batch %} <span class="badge muted">batch</span>{% endif %}</td><td>{{ params(j.params) }}</td><td>{{ j.attempt }}/{{ j.max_attempts }}</td>
+<td class="mono">{{ j.concurrency_key or '' }}{% if j.concurrency_key %} ≤{{ j.concurrency_limit }}{% endif %}</td>
+<td>{{ when(j.created_at) }}</td><td>{{ instance_link(j.instance_id) }} {{ j.step_id or '' }}</td><td>{{ short(j.dispatch_id) }}</td>
+<td><form class="inline" method="post" action="{{ url_for('cancel_dispatch', dispatch_id=j.dispatch_id) }}"><button>Cancel</button></form></td></tr>
+{% endfor %}</table></div>
+{% else %}<p class="empty">Empty.</p>{% endif %}
+{% endfor %}
+
+{% for label, rows in (('Delayed', delayed), ('Waiting to retry', retrying)) %}
+<h2>{{ label }} ({{ rows | length }}{% if rows | length == 100 %}+{% endif %})</h2>
+{% if rows %}
+<div class="wrap"><table>
+<tr><th>Job</th><th>Priority</th><th>Params</th><th>Attempt</th><th>Due</th><th>Dispatch</th><th></th></tr>
+{% for j in rows %}
+<tr><td>{{ j.job_name }}{% if j.batch %} <span class="badge muted">batch flush</span>{% endif %}</td><td>{{ j.priority }}</td><td>{{ params(j.params) }}</td><td>{{ j.attempt }}/{{ j.max_attempts }}</td>
+<td>{{ when(j.due_at) }}</td><td>{{ short(j.dispatch_id) }}</td>
+<td><form class="inline" method="post" action="{{ url_for('run_now', dispatch_id=j.dispatch_id) }}"><button>Run now</button></form>
+<form class="inline" method="post" action="{{ url_for('drop_waiting', dispatch_id=j.dispatch_id) }}"><button class="danger">Remove</button></form></td></tr>
+{% endfor %}</table></div>
+{% else %}<p class="empty">Empty.</p>{% endif %}
+{% endfor %}
+
+<h2 id="schedules">Cron jobs</h2>
+{% if schedules.jobs %}
+<table><tr><th>Job</th><th>Next run</th><th></th></tr>
+{% for s in schedules.jobs %}
+<tr><td>{{ s.name }}</td><td>{{ when(s.next_run) }}</td>
+<td><form class="inline" method="post" action="{{ url_for('run_schedule_now') }}"><input type="hidden" name="kind" value="job"><input type="hidden" name="name" value="{{ s.name }}"><button>Run now</button></form></td></tr>
+{% endfor %}</table>
+{% else %}<p class="empty">No cron jobs registered.</p>{% endif %}
+{% endblock %}

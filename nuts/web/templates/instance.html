@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% from "_macros.html" import status, when, params, short with context %}
+{% block content %}
+<h1>{{ doc.workflow_name }} <span class="mono muted">{{ doc.instance_id }}</span></h1>
+<table style="width:auto">
+<tr><th>Status</th><td>{{ status(doc.status) }}</td></tr>
+{% if doc.error %}<tr><th>Error</th><td class="mono bad">{{ doc.error }}</td></tr>{% endif %}
+<tr><th>Entity</th><td class="mono">{{ doc.entity_key or '—' }}</td></tr>
+<tr><th>Created</th><td>{{ when(doc.created_at) }}</td></tr>
+<tr><th>Updated</th><td>{{ when(doc.updated_at) }} <span class="muted">(version {{ doc._v }})</span></td></tr>
+<tr><th>Params</th><td>{{ params(doc.params) }}</td></tr>
+</table>
+
+<h2>Steps</h2>
+<div class="wrap"><table>
+<tr><th>Step</th><th>Kind</th><th>Op / event</th><th>Requires</th><th>Status</th><th>Result / error</th><th>Concurrency</th><th>Dispatch</th></tr>
+{% for s in doc.steps %}
+<tr><td>{{ s.step_id }}</td><td>{{ s.kind }}</td><td class="mono">{{ s.op or s.event }}</td><td>{{ (s.requires or []) | join(', ') }}</td>
+<td>{{ status(s.status) }}{% if s.wait_deadline %}<div class="muted">gives up {{ when(s.wait_deadline) }}</div>{% endif %}</td>
+<td>{% if s.error %}<span class="mono bad">{{ s.error }}</span>{% else %}{{ params(s.result) }}{% endif %}</td>
+<td class="mono">{{ s.concurrency_key or '' }}</td><td>{{ short(s.dispatch_id) }}</td></tr>
+{% endfor %}</table></div>
+
+{% if doc.pending_signals %}
+<h2>Signals not yet consumed</h2>
+<table>{% for event, payload in doc.pending_signals.items() %}<tr><td class="mono">{{ event }}</td><td>{{ params(payload) }}</td></tr>{% endfor %}</table>
+{% endif %}
+
+{% if doc.status == 'active' %}
+<h2>Actions</h2>
+<form class="form" method="post" action="{{ url_for('signal_instance', instance_id=doc.instance_id) }}">
+  <label>Event<input name="event" required value="{{ (doc.steps | selectattr('kind', 'equalto', 'wait') | map(attribute='event') | first) or '' }}"></label>
+  <label>Payload (JSON)<textarea name="payload" rows="1" cols="40"></textarea></label>
+  <button>Send signal</button>
+</form>
+<p></p>
+<form class="form" method="post" action="{{ url_for('cancel_instance', instance_id=doc.instance_id) }}" onsubmit="return confirm('Cancel this instance?')">
+  <label>Reason<input name="reason" size="40"></label>
+  <button class="danger">Cancel instance</button>
+</form>
+{% endif %}
+{% endblock %}

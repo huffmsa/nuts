@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% from "_macros.html" import status, when, instance_link with context %}
+{% macro progress(doc) -%}
+{%- set done = doc.steps | selectattr('status', 'equalto', 'completed') | list | length -%}
+{{ done }}/{{ doc.steps | length }}
+{%- endmacro %}
+{% block content %}
+<h1>Workflows</h1>
+<form class="form" method="get" action="{{ url_for('find_instance') }}">
+  <label>Instance id or entity key<input name="q" size="40" placeholder="sim:1234"></label>
+  <button>Open</button>
+</form>
+
+<h2>Active ({{ active_count }}{% if active_count > active_rows | length %}, showing {{ active_rows | length }}{% endif %})</h2>
+<form class="form" method="get">
+  <label>Workflow name<input name="workflow" value="{{ workflow }}"></label><button>Filter</button>
+</form>
+{% if active_rows %}
+<div class="wrap"><table>
+<tr><th>Instance</th><th>Workflow</th><th>Entity</th><th>Steps done</th><th>Current</th><th>Created</th><th>Updated</th></tr>
+{% for d in active_rows %}
+<tr><td>{{ instance_link(d.instance_id) }}</td><td>{{ d.workflow_name }}</td><td class="mono">{{ d.entity_key or '' }}</td><td>{{ progress(d) }}</td>
+<td>{% for s in d.steps if s.status and s.status != 'completed' %}{{ s.step_id }} {{ status(s.status) }} {% endfor %}</td>
+<td>{{ when(d.created_at) }}</td><td>{{ when(d.updated_at) }}</td></tr>
+{% endfor %}</table></div>
+{% else %}<p class="empty">None.</p>{% endif %}
+
+<h2>Recently finished</h2>
+{% if finished_rows %}
+<div class="wrap"><table>
+<tr><th>Instance</th><th>Workflow</th><th>Entity</th><th>Status</th><th>Error</th><th>Finished</th></tr>
+{% for d in finished_rows %}
+<tr><td>{{ instance_link(d.instance_id) }}</td><td>{{ d.workflow_name }}</td><td class="mono">{{ d.entity_key or '' }}</td><td>{{ status(d.status) }}</td><td class="mono">{{ d.error or '' }}</td><td>{{ when(d.updated_at) }}</td></tr>
+{% endfor %}</table></div>
+{% else %}<p class="empty">None.</p>{% endif %}
+
+<h2>Scheduled templates</h2>
+{% if schedules %}
+<table><tr><th>Template</th><th>Next run</th><th></th></tr>
+{% for s in schedules %}
+<tr><td>{{ s.name }}</td><td>{{ when(s.next_run) }}</td>
+<td><form class="inline" method="post" action="{{ url_for('run_schedule_now') }}"><input type="hidden" name="kind" value="workflow"><input type="hidden" name="name" value="{{ s.name }}"><button>Run now</button></form></td></tr>
+{% endfor %}</table>
+{% else %}<p class="empty">No YAML workflow templates registered.</p>{% endif %}
+{% endblock %}

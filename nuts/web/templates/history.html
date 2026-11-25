@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% from "_macros.html" import status, when, short, instance_link with context %}
+{% block content %}
+<h1>History</h1>
+<form class="form" method="get">
+  <label>Job name<input name="job" value="{{ job }}"></label>
+  <label>Outcome<select name="outcome"><option value="">any</option>{% for o in outcomes %}<option {{ 'selected' if o == outcome }}>{{ o }}</option>{% endfor %}</select></label>
+  <button>Filter</button>
+</form>
+<p class="muted">The most recent finished attempts, capped by each worker's <span class="mono">history_length</span>.</p>
+{% if rows %}
+<div class="wrap"><table>
+<tr><th>Finished</th><th>Job</th><th>Outcome</th><th>Attempt</th><th>Took</th><th>Error</th><th>Step</th><th>Worker</th><th>Dispatch</th></tr>
+{% for h in rows %}
+<tr><td>{{ when(h.finished_at) }}</td><td>{{ h.job_name }}{% if h.get('items') is not none %} <span class="muted">({{ h.get('items') }} items{% if h.failed_items %}, {{ h.failed_items }} failed{% endif %})</span>{% endif %}</td>
+<td>{{ status(h.outcome) }}</td><td>{{ h.attempt }}</td><td>{% if h.duration_seconds is not none %}{{ h.duration_seconds }}s{% endif %}</td>
+<td class="mono">{{ h.error or '' }}</td><td>{{ instance_link(h.instance_id) }} {{ h.step_id or '' }}</td><td>{{ short(h.worker_id) }}</td><td>{{ short(h.dispatch_id) }}</td></tr>
+{% endfor %}</table></div>
+{% else %}<p class="empty">Nothing yet.</p>{% endif %}
+{% endblock %}

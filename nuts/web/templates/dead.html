@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% from "_macros.html" import when, params, instance_link with context %}
+{% block content %}
+<h1>Dead letters ({{ rows | length }}{% if rows | length == 100 %}+{% endif %})</h1>
+<p class="muted">Jobs and batch items that ran out of attempts. Redrive queues one again with a fresh attempt count.</p>
+{% if rows %}
+<form method="post" action="{{ url_for('purge_dead_letters') }}" onsubmit="return confirm('Delete every dead letter?')"><button class="danger">Delete all</button></form>
+<div class="wrap"><table>
+<tr><th>Died</th><th>Job</th><th>Params</th><th>Attempts</th><th>Error</th><th>Step</th><th></th></tr>
+{% for d in rows %}
+<tr><td>{{ when(d.entry_id | entry_time) }}</td><td>{{ d.job_name }}{% if d.kind == 'batch_item' %} <span class="badge muted">batch item</span>{% endif %}</td>
+<td>{{ params(d.params) }}</td><td>{{ d.attempt }}</td><td class="mono">{{ d.error }}</td><td>{{ instance_link(d.instance_id) }} {{ d.step_id or '' }}</td>
+<td>{% if not d.instance_id %}<form class="inline" method="post" action="{{ url_for('redrive', entry_id=d.entry_id) }}"><button>Redrive</button></form>{% endif %}
+<form class="inline" method="post" action="{{ url_for('delete_dead_letter', entry_id=d.entry_id) }}"><button class="danger">Delete</button></form></td></tr>
+{% endfor %}</table></div>
+{% else %}<p class="empty">None.</p>{% endif %}
+{% endblock %}

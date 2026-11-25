@@ -352,3 +352,46 @@ NUTS supports three ways to chain jobs:
 1. **Workflows (YAML)**: Best for a fixed, recurring pipeline -- cron-triggered, same shape every run.
 2. **Dynamic Instances (`create_instance`)**: Best when the step set or parameters vary per run -- per-entity pipelines, steps composed at runtime, or a step that needs to wait on an external event.
 3. **DAG Jobs (`job.next`)**: Best for simple linear chains where you just want the next job to run with this job's result.
+
+## Admin UI
+
+An optional, server-rendered admin UI ships with the package. It's plain HTML from FastAPI and Jinja templates, with no JavaScript build and nothing extra to deploy.
+
+```bash
+pip install nuts-scheduler[web]
+REDIS_URL=redis://localhost:6379 uvicorn nuts.web:app --port 8000
+```
+
+Or mount it inside an app you already run:
+
+```python
+from nuts.web import create_app
+
+app.mount('/nuts', create_app(redis))
+```
+
+Pages:
+
+- **Overview**: queue depths per priority, delayed and retrying counts, dead letters, the current leader and live workers.
+- **Jobs**: what's running, what's waiting for a concurrency slot, what's queued, delayed or waiting to retry, and cron schedules. Publish a job, cancel a dispatch, or make a delayed one run now.
+- **History**: recent finished attempts with outcome, duration and error. Each worker keeps the last `history_length` (default 1000; 0 turns it off).
+- **Dead letters**: redrive (queue again with a fresh attempt count) or delete.
+- **Workflows**: active and recently finished instances, lookup by instance id or entity key, and an instance page with each step's status and result. Send a signal or cancel from there.
+- **Concurrency**: each key's running holders and the length of its line.
+
+Add `?refresh=10` to any page to reload it every 10 seconds.
+
+The UI has no authentication of its own and its buttons change state. Keep it on an internal network, or pass FastAPI dependencies that check credentials:
+
+```python
+create_app(redis, dependencies=[Depends(require_admin)])
+```
+
+Everything the UI shows or does is also available as plain functions in `nuts.admin`, for scripts and shells:
+
+```python
+from nuts import admin
+
+admin.overview(redis)
+admin.redrive(redis, admin.dead_letters(redis)[0]['entry_id'])
+```

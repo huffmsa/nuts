@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Overview</h1>
+<div class="cards">
+  {% for s in data.streams %}
+  <div class="card"><div class="n">{{ s.queued }}</div><div class="l">{{ s.priority }} queued · {{ s.in_flight }} in flight</div></div>
+  {% endfor %}
+  <div class="card"><div class="n">{{ data.delayed }}</div><div class="l">delayed</div></div>
+  <div class="card"><div class="n">{{ data.retrying }}</div><div class="l">waiting to retry</div></div>
+  <div class="card"><div class="n {{ 'bad' if data.dead }}">{{ data.dead }}</div><div class="l"><a href="{{ url_for('dead_letters') }}">dead letters</a></div></div>
+  <div class="card"><div class="n">{{ data.active_instances }}</div><div class="l"><a href="{{ url_for('workflows') }}">active workflow instances</a></div></div>
+  <div class="card"><div class="n">{{ data.dirty_instances }}</div><div class="l">instances waiting for the leader</div></div>
+  <div class="card"><div class="n">{{ data.keys_with_waiters }}</div><div class="l"><a href="{{ url_for('concurrency') }}">concurrency keys with a line</a></div></div>
+</div>
+
+<h2>Leader</h2>
+{% if data.leader %}<p><span class="mono">{{ data.leader }}</span> <span class="muted">· lease renews in {{ data.leader_ttl }}s</span></p>
+{% else %}<p class="bad">No leader. Cron jobs, retries and workflows won't advance until a worker takes over.</p>{% endif %}
+
+<h2>Workers seen in the last 2 minutes</h2>
+{% if data.workers %}
+<table><tr><th>Worker</th><th>Holding</th><th>Last read</th></tr>
+{% for w in data.workers %}<tr><td class="mono">{{ w.id }}{% if w.id == data.leader %} <span class="badge info">leader</span>{% endif %}</td><td>{{ w.holding }}</td><td>{{ (w.idle_ms / 1000) | round(1) }}s ago</td></tr>{% endfor %}
+</table>
+{% else %}<p class="empty">None.</p>{% endif %}
+
+<h2>Schedules</h2>
+<p>{{ data.cron_jobs }} cron jobs and {{ data.workflow_templates }} workflow templates. <a href="{{ url_for('jobs') }}#schedules">See schedules</a>.</p>
+{% endblock %}

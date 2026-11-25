@@ -14,6 +14,7 @@ from redis import Redis
 PRIORITIES = ('high', 'normal', 'low')
 STREAM_PREFIX = 'nuts|stream|'
 DLQ_STREAM = 'nuts|jobs|dlq'
+HISTORY_STREAM = 'nuts|jobs|history'
 DELAYED_QUEUE = 'nuts|jobs|delayed'
 CANCELLED_PREFIX = 'nuts|jobs|cancelled|'
 CANCEL_TTL_SECONDS = 604800
@@ -105,6 +106,12 @@ def ack(redis: Redis, stream: str, group: str, entry_id) -> None:
 def to_dlq(redis: Redis, payload: dict, error: str) -> None:
     payload = dict(payload, error=error)
     redis.xadd(DLQ_STREAM, {'data': json.dumps(payload)})
+
+
+def record_history(redis: Redis, entry: dict, max_length: int) -> None:
+    '''Append to a capped log of finished dispatches. Exists only for visibility; nothing reads it to make decisions.'''
+    if max_length > 0:
+        redis.xadd(HISTORY_STREAM, {'data': json.dumps(entry)}, maxlen=max_length, approximate=True)
 
 
 def cancel(redis: Redis, dispatch_id: str) -> None:
