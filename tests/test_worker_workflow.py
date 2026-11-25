@@ -173,7 +173,9 @@ def test_signal_after_wait_step_reached(redis):
     assert doc['status'] == 'completed'
 
 
-def test_concurrency_gated_step_is_deferred_until_slot_frees(redis):
+def test_concurrency_gated_step_waits_for_a_free_slot(redis):
+    ran = []
+
     class SlowMod:
         class Job(NutsJob):
             def __init__(self):
@@ -181,27 +183,27 @@ def test_concurrency_gated_step_is_deferred_until_slot_frees(redis):
                 self.name = 'SlowOp'
 
             def run(self, **kwargs):
+                ran.append(kwargs['n'])
                 self.success = True
 
     worker = _worker(redis, [SlowMod])
-    plan = lambda: [{'step_id': 'op', 'op': 'SlowOp', 'requires': None,
-                      'concurrency_key': 'shared', 'concurrency_limit': 1}]
+    plan = [{'step_id': 'op', 'op': 'SlowOp', 'requires': None,
+             'concurrency_key': 'shared', 'concurrency_limit': 1}]
+    instance_id = inst.create_instance(redis, 'wf', plan, params={'n': 1})
 
-    id1 = inst.create_instance(redis, 'wf', plan())
-    id2 = inst.create_instance(redis, 'wf', plan())
+    # Something else holds the only slot.
+    worker.concurrency.acquire('shared', 'other-holder', limit=1, lease_seconds=60)
 
-    worker.sweep_active_workflow_instances()
+    _run_until_idle(worker, redis, ticks=3)
+    assert ran == []
+    assert redis.llen(worker.concurrency.waiting_key('shared')) == 1
+    assert next(s for s in inst.get_instance(redis, instance_id)['steps'])['status'] == 'dispatched'
 
-    statuses = {
-        id1: next(s for s in inst.get_instance(redis, id1)['steps'])['status'],
-        id2: next(s for s in inst.get_instance(redis, id2)['steps'])['status'],
-    }
-    # Exactly one of the two got dispatched this tick -- the other stays
-    # untouched (status None) until a slot frees up.
-    dispatched = [v for v in statuses.values() if v == 'dispatched']
-    deferred = [v for v in statuses.values() if v is None]
-    assert len(dispatched) == 1
-    assert len(deferred) == 1
+    worker.concurrency.release('shared', 'other-holder')
+    _run_until_idle(worker, redis, ticks=3)
+
+    assert ran == [1]
+    assert inst.get_instance(redis, instance_id)['status'] == 'completed'
 
 
 def test_dlq_after_max_retries_fails_the_step_not_the_whole_run(redis):

@@ -12,6 +12,8 @@ class NutsJob():
     error: Exception
     next: Union[str, None]
     max_attempts: int = 5
+    timeout_seconds: Union[float, None] = None
+    failed_items: dict
 
     def __init__(self, **kwargs):
         '''
@@ -29,6 +31,12 @@ class NutsJob():
         self.error = kwargs.get('error', None)
         self.next = kwargs.get('next', None)
         self.max_attempts = kwargs.get('max_attempts', self.max_attempts)
+        # After this long the worker stops renewing its claim, so another
+        # worker may pick the job up again. None means no limit.
+        self.timeout_seconds = kwargs.get('timeout_seconds', self.timeout_seconds)
+        # Batch jobs only: {index into items: error} for items that failed
+        # while the batch as a whole succeeded. Those items are retried alone.
+        self.failed_items = {}
 
 
 class JobModule(Protocol):
@@ -38,12 +46,13 @@ class JobModule(Protocol):
 
 class JobDefinition:
     '''
-        Metadata probed from a registered job class: name, schedule, and
-        max_attempts. Does not hold any execution state.
+        Metadata probed from a registered job class: name, schedule,
+        max_attempts and timeout. Does not hold any execution state.
     '''
     name: str
     schedule: Union[str, None]
     max_attempts: int
+    timeout_seconds: Union[float, None]
     job_class: type[NutsJob]
 
     def __init__(self, job_class: type[NutsJob]):
@@ -51,6 +60,7 @@ class JobDefinition:
         self.name = probe.name
         self.schedule = probe.schedule
         self.max_attempts = probe.max_attempts
+        self.timeout_seconds = getattr(probe, 'timeout_seconds', None)
         self.job_class = job_class
 
 

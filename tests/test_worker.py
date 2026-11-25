@@ -91,6 +91,8 @@ def test_claim_execute_ack_removes_work(redis):
 
 
 def test_job_next_dag_chaining(redis):
+    seen = []
+
     class FirstMod:
         class Job(NutsJob):
             def __init__(self):
@@ -110,7 +112,7 @@ def test_job_next_dag_chaining(redis):
                 self.name = 'Second'
 
             def run(self, **kwargs):
-                self.result = kwargs.get('value')
+                seen.append(kwargs.get('value'))
                 self.success = True
 
     worker = _worker(redis, [FirstMod, SecondMod])
@@ -119,7 +121,8 @@ def test_job_next_dag_chaining(redis):
     worker.run()
     worker.run()
 
-    assert redis.xlen(dispatch.stream_key('normal')) == 2
+    assert seen == [11]
+    assert redis.xlen(dispatch.stream_key('normal')) == 0
 
 
 def test_priority_order_is_strict(redis):

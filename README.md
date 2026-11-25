@@ -33,22 +33,47 @@ main.py
 An example `main.py` might look like
 
 ```python
+import signal
 from nuts import Worker
 from .jobs import a_job, b_job
 from redis import Redis
 
 r = Redis()
 
-worker = Worker(redis=r, jobs=[a_job, b_job])
+worker = Worker(redis=r, jobs=[a_job, b_job], max_concurrent_jobs=8)
 
-while worker.should_run:
-    worker.run()
+signal.signal(signal.SIGTERM, worker.shutdown)
+worker.serve()
 ```
 
 You provide the list of jobs (discussed in the next section), a redis connection and you're off to the races.
-If you are running multiple workers connected to the same worker, NUTS will automatically handle leadership assignment for scheduling management.
+If you are running multiple workers connected to the same Redis, NUTS will automatically handle leadership assignment for scheduling management.
 
-You may pass in an arbitrary `kwargs`, it is suggested to use these to provide your worker with any shared functionality that your jobs may need (database connections, etc).
+`serve()` runs until `shutdown()` is called, then waits for in-flight jobs before returning. It runs:
+
+- the leader's duties (cron, delayed jobs, retries, workflow advancement, recovery) in their own thread, so a long job never stalls scheduling;
+- jobs in a pool of `max_concurrent_jobs` threads (default 1), which suits IO-bound jobs such as vendor API calls;
+- a heartbeat that renews the worker's claim on every job it holds, so slow jobs aren't mistaken for crashed ones.
+
+When idle it blocks on Redis (`block_ms`, default 1000) instead of polling.
+
+`worker.run()` is a single step (one leader tick, then at most one job) and returns immediately when there's nothing to do. It's handy in tests; use `serve()` in production.
+
+You may pass in an arbitrary `kwargs`, it is suggested to use these to provide your worker with any shared functionality that your jobs may need (database connections, etc). With `max_concurrent_jobs` above 1, jobs run on several threads at once, so anything shared this way must be thread-safe.
+
+Worker options:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `max_concurrent_jobs` | 1 | Jobs run at once by `serve()` |
+| `block_ms` | 1000 | How long an idle `serve()` waits on Redis per read |
+| `pel_min_idle_ms` | 60000 | How long a claim can go without a heartbeat before another worker takes it over |
+| `heartbeat_interval_seconds` | `pel_min_idle_ms / 3` | How often claims and concurrency leases are renewed |
+| `concurrency_lease_seconds` | 300 | How long a concurrency slot survives without a heartbeat (e.g. after a crash) |
+| `leader_interval_seconds` | 1.0 | Pause between leader ticks under `serve()` |
+| `leader_tick_budget_seconds` | 5.0 | Max time per tick spent advancing workflow instances |
+| `full_sweep_interval_seconds` | 300 | How often the leader re-checks every active instance as a safety net |
+| `instance_ttl_seconds` | 604800 | How long finished instances are kept |
 
 
 ### Jobs
@@ -90,8 +115,10 @@ from redis import Redis
 
 queue = WorkQueue(Redis())
 
-queue.publish('MyFirstJob', {'job_args': [1, 2]})
+dispatch_id = queue.publish('MyFirstJob', {'job_args': [1, 2]})
 ```
+
+`publish` returns a dispatch id and raises if Redis rejects the write, so a caller always knows whether the job was queued. Pass the id to `queue.cancel(dispatch_id)` to skip that one dispatch (and any retries of it) when a worker next picks it up. A job that's already running finishes.
 
 `publish` accepts a few optional, keyword-only arguments:
 
@@ -117,11 +144,48 @@ If a job raises (or sets `success = False`), it's retried with exponential backo
 
 Defaults are 5 attempts, a 5s base backoff, capped at 300s. Override globally via `Worker(..., retry_policy=RetryPolicy(base=..., cap=..., max_attempts=...))`, per job class via a `max_attempts` attribute on your `Job`, or per dispatch via `WorkQueue.publish(..., max_attempts=...)` -- resolved in that order (dispatch overrides job class overrides the global default).
 
-A worker that dies mid-job doesn't lose the work either: Redis tracks the in-flight claim, and the leader periodically reclaims anything that's gone stale (`pel_min_idle_ms`, default 60s) and redelivers it. Because of this, `run()` implementations should be idempotent where practical -- a crash-reclaim can mean a job runs more than once, trading possible duplicate execution for never silently losing work.
+A worker that dies mid-job doesn't lose the work either: Redis tracks the in-flight claim, and the leader reclaims anything whose worker has stopped heartbeating for `pel_min_idle_ms` (default 60s) and redelivers it. A live worker keeps renewing its claim however long the job runs. To cap that, set `timeout_seconds` on the job class: once a job passes it, the worker stops renewing and the job may be picked up again elsewhere (the original run isn't killed).
+
+Because of this, `run()` implementations should be idempotent where practical -- a crash-reclaim can mean a job runs more than once, trading possible duplicate execution for never silently losing work.
+
+Acked entries are deleted from the streams, so they don't grow without bound. The dead-letter stream is kept for inspection.
 
 #### Per-Key Concurrency Limits
 
-`concurrency_key` + `concurrency_limit` cap how many in-flight items share a key at once -- e.g. "no more than 3 concurrent calls to vendor X regardless of how many jobs are queued for it." A dispatch that can't get a slot simply waits for one to free up rather than failing.
+`concurrency_key` + `concurrency_limit` cap how many running jobs share a key at once -- e.g. "no more than 3 concurrent calls to vendor X regardless of how many jobs are queued for it." This applies to every kind of dispatch: immediate, delayed, retries, batch flushes and workflow steps.
+
+A slot is taken when a worker starts the job, not when it's queued, and released when it finishes. A job that can't get a slot is parked in a first-in, first-out line for its key and handed the next slot that frees, so it neither fails nor loses its place to later arrivals. Slots held by a crashed worker expire after `concurrency_lease_seconds`; running jobs keep theirs renewed by the heartbeat.
+
+#### Batch Jobs
+
+Some downstream APIs take many items per call. `publish_to_batch` collects items and runs the job once per group:
+
+```python
+queue.publish_to_batch(
+    'UpdateDevices',
+    {'sim': 1234, 'plan': 'b'},
+    batch_key='verizon:change_plan',  # items are grouped by job, priority and batch_key
+    max_items=500,                     # run as soon as this many are waiting
+    window_seconds=10,                 # or this long after the first item, whichever is first
+    concurrency_key='verizon',
+)
+```
+
+The job receives `items`, a list of the params each item was published with. To fail some items while the rest succeed, set `failed_items` to `{index: error}` and `success = True`; only those items are retried (alone, with backoff), and an item that runs out of attempts goes to the dead-letter stream by itself. If the job raises, the whole batch is retried with the same items.
+
+```python
+class Job(NutsJob):
+    def __init__(self):
+        super().__init__()
+        self.name = 'UpdateDevices'
+
+    def run(self, items, **kwargs):
+        response = carrier.update([i['sim'] for i in items])
+        self.failed_items = {n: err for n, err in response.errors.items()}
+        self.success = True
+```
+
+A batch run is an ordinary dispatch, so priority, concurrency limits, retries, heartbeats and reclaim all apply to it.
 
 ### Chaining Jobs - DAG
 
@@ -171,8 +235,7 @@ worker = Worker(
     workflow_directory='./workflows'  # Directory containing .yaml files
 )
 
-while worker.should_run:
-    worker.run()
+worker.serve()
 ```
 
 #### Workflow Features
@@ -258,6 +321,29 @@ signal_instance(redis, instance_id, 'vendor_ack', {'approved': True})
 ```
 
 This works regardless of whether the signal arrives before or after the instance's workflow actually reaches that step -- nothing is lost either way.
+
+Add `timeout_seconds` to a wait step to give up if the signal doesn't arrive in time. The step fails with a "timed out" error, which fails the instance.
+
+#### Instances Tied to an Entity
+
+Pass `entity_key` to tie an instance to something outside NUTS, such as a device or an order. The code that produces signals then only needs to know the entity:
+
+```python
+from nuts import create_instance, signal_entity, cancel_entity
+
+create_instance(redis, 'configure-sim', plan, params, entity_key='sim:1234', replace=True)
+
+# later, from whatever sees the device come online
+signal_entity(redis, 'sim:1234', 'device_online', {'seen_at': '...'})
+```
+
+Each entity has at most one active instance. Creating another raises `EntityBusyError`, unless `replace=True`, in which case the old one is cancelled and the new one takes its place. `cancel_instance(redis, instance_id)` and `cancel_entity(redis, entity_key)` stop an instance: steps not yet started never run, a queued step is skipped, and a running step finishes but nothing after it starts.
+
+#### How Instances Advance
+
+Anything that can move an instance forward (creating it, a step finishing, a signal, a wait timing out) marks it dirty, and the leader only processes dirty instances. Instances that are just waiting cost nothing per tick. As a safety net the leader also re-checks every active instance every `full_sweep_interval_seconds`; that pass reads in batches and only does work for instances that can actually move.
+
+Delivery is at least once: if the leader dies between queuing a step and recording it, the step may be queued twice. Make steps idempotent.
 
 #### Workflow vs DAG Jobs vs Dynamic Instances
 
