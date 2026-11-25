@@ -1,6 +1,6 @@
 # Roadmap
 
-Features planned after 1.0, roughly in priority order. They came out of planning a move of carrier-facing background jobs onto NUTS. Build each one when a real job needs it.
+Features planned after 1.0, roughly in priority order. They came out of planning moving background jobs that call rate-limited third-party APIs onto NUTS. Build each one when a real job needs it.
 
 ## Rate limits per key
 
@@ -18,7 +18,7 @@ Plan: a Redis set of paused names and keys, checked when a job starts, in the sa
 
 Workflow instances can be keyed by entity (`entity_key`), but plain jobs can't. A retried API call or a double click can queue the same job twice.
 
-Plan: `publish(..., dedupe_key='sim:42:refresh', dedupe_seconds=300)` does `SET NX EX` before queueing and returns the existing dispatch id if the key is taken. Release the key when the job finishes, so a later publish isn't blocked for the whole window.
+Plan: `publish(..., dedupe_key='order:42:refresh', dedupe_seconds=300)` does `SET NX EX` before queueing and returns the existing dispatch id if the key is taken. Release the key when the job finishes, so a later publish isn't blocked for the whole window.
 
 ## Test helpers for job code
 

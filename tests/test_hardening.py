@@ -53,16 +53,16 @@ def test_immediate_publish_respects_concurrency_limit(redis):
     w1 = Worker(redis, [mod])
     other['worker'] = Worker(redis, [mod])
     q = WorkQueue(redis)
-    q.publish('Gated', {'n': 1}, concurrency_key='verizon', concurrency_limit=1)
-    q.publish('Gated', {'n': 2}, concurrency_key='verizon', concurrency_limit=1)
+    q.publish('Gated', {'n': 1}, concurrency_key='partner-api', concurrency_limit=1)
+    q.publish('Gated', {'n': 2}, concurrency_key='partner-api', concurrency_limit=1)
 
     w1.consume_one()
     assert ran == [1]
 
     w1.consume_one()
     assert ran == [1, 2]
-    assert redis.zcard(w1.concurrency.holders_key('verizon')) == 0
-    assert redis.llen(w1.concurrency.waiting_key('verizon')) == 0
+    assert redis.zcard(w1.concurrency.holders_key('partner-api')) == 0
+    assert redis.llen(w1.concurrency.waiting_key('partner-api')) == 0
 
 
 def test_parked_jobs_get_slots_in_arrival_order(redis):
@@ -153,7 +153,7 @@ def test_acked_entries_are_removed_from_streams(redis):
 
 def test_idle_waiting_instance_is_not_rewritten(redis):
     worker = Worker(redis, [])
-    instance_id = inst.create_instance(redis, 'wf', [{'step_id': 'online', 'kind': 'wait', 'event': 'device_online'}])
+    instance_id = inst.create_instance(redis, 'wf', [{'step_id': 'paid', 'kind': 'wait', 'event': 'payment_received'}])
     worker.sweep_active_workflow_instances()
     version = inst.get_instance(redis, instance_id)['_v']
     for _ in range(5):
@@ -164,16 +164,16 @@ def test_idle_waiting_instance_is_not_rewritten(redis):
 
 def test_leader_only_touches_dirty_instances(redis):
     ran = []
-    worker = Worker(redis, [make_job('Apply', lambda job, sim, **kw: (ran.append(sim), setattr(job, 'success', True)))])
+    worker = Worker(redis, [make_job('Apply', lambda job, order, **kw: (ran.append(order), setattr(job, 'success', True)))])
     plan = [
-        {'step_id': 'online', 'kind': 'wait', 'event': 'device_online'},
-        {'step_id': 'apply', 'op': 'Apply', 'requires': ['online']},
+        {'step_id': 'paid', 'kind': 'wait', 'event': 'payment_received'},
+        {'step_id': 'apply', 'op': 'Apply', 'requires': ['paid']},
     ]
-    ids = [inst.create_instance(redis, 'conductor', plan, {'sim': n}) for n in range(300)]
+    ids = [inst.create_instance(redis, 'fulfilment', plan, {'order': n}) for n in range(300)]
     worker.advance_dirty_instances()
     assert redis.scard(inst.DIRTY_SET) == 0
 
-    inst.signal_instance(redis, ids[7], 'device_online')
+    inst.signal_instance(redis, ids[7], 'payment_received')
     assert redis.smembers(inst.DIRTY_SET) == {ids[7].encode()}
 
     drain(worker, ticks=4)
@@ -185,35 +185,35 @@ def test_leader_only_touches_dirty_instances(redis):
 def test_entity_key_lookup_signal_and_cleanup(redis):
     worker = Worker(redis, [make_job('Apply', ok)])
     plan = [
-        {'step_id': 'online', 'kind': 'wait', 'event': 'device_online'},
-        {'step_id': 'apply', 'op': 'Apply', 'requires': ['online']},
+        {'step_id': 'paid', 'kind': 'wait', 'event': 'payment_received'},
+        {'step_id': 'apply', 'op': 'Apply', 'requires': ['paid']},
     ]
-    instance_id = inst.create_instance(redis, 'conductor', plan, entity_key='sim:42')
-    assert inst.get_instance_id_for_entity(redis, 'sim:42') == instance_id
+    instance_id = inst.create_instance(redis, 'fulfilment', plan, entity_key='order:42')
+    assert inst.get_instance_id_for_entity(redis, 'order:42') == instance_id
 
     with pytest.raises(inst.EntityBusyError):
-        inst.create_instance(redis, 'conductor', plan, entity_key='sim:42')
+        inst.create_instance(redis, 'fulfilment', plan, entity_key='order:42')
 
-    assert inst.signal_entity(redis, 'sim:42', 'device_online') == instance_id
+    assert inst.signal_entity(redis, 'order:42', 'payment_received') == instance_id
     drain(worker, ticks=4)
 
     assert inst.get_instance(redis, instance_id)['status'] == 'completed'
-    assert inst.get_instance_id_for_entity(redis, 'sim:42') is None
-    assert inst.signal_entity(redis, 'sim:42', 'device_online') is None
+    assert inst.get_instance_id_for_entity(redis, 'order:42') is None
+    assert inst.signal_entity(redis, 'order:42', 'payment_received') is None
 
 
 def test_replace_cancels_previous_instance_for_entity(redis):
     ran = []
     worker = Worker(redis, [make_job('Apply', lambda job, op, **kw: (ran.append(op), setattr(job, 'success', True)))])
     plan = [
-        {'step_id': 'online', 'kind': 'wait', 'event': 'device_online'},
-        {'step_id': 'apply', 'op': 'Apply', 'requires': ['online']},
+        {'step_id': 'paid', 'kind': 'wait', 'event': 'payment_received'},
+        {'step_id': 'apply', 'op': 'Apply', 'requires': ['paid']},
     ]
-    old = inst.create_instance(redis, 'conductor', plan, {'op': 'old'}, entity_key='sim:1')
-    new = inst.create_instance(redis, 'conductor', plan, {'op': 'new'}, entity_key='sim:1', replace=True)
+    old = inst.create_instance(redis, 'fulfilment', plan, {'op': 'old'}, entity_key='order:1')
+    new = inst.create_instance(redis, 'fulfilment', plan, {'op': 'new'}, entity_key='order:1', replace=True)
 
     assert inst.get_instance(redis, old)['status'] == 'cancelled'
-    inst.signal_entity(redis, 'sim:1', 'device_online')
+    inst.signal_entity(redis, 'order:1', 'payment_received')
     drain(worker, ticks=4)
 
     assert ran == ['new']
@@ -239,8 +239,8 @@ def test_cancelled_instance_skips_its_queued_step(redis):
 def test_wait_step_times_out(redis):
     worker = Worker(redis, [])
     instance_id = inst.create_instance(redis, 'wf', [
-        {'step_id': 'online', 'kind': 'wait', 'event': 'device_online', 'timeout_seconds': 0.1},
-    ], entity_key='sim:9')
+        {'step_id': 'paid', 'kind': 'wait', 'event': 'payment_received', 'timeout_seconds': 0.1},
+    ], entity_key='order:9')
     worker.run()
     assert inst.get_instance(redis, instance_id)['status'] == 'active'
 
@@ -250,7 +250,7 @@ def test_wait_step_times_out(redis):
     doc = inst.get_instance(redis, instance_id)
     assert doc['status'] == 'failed'
     assert 'timed out' in doc['error']
-    assert inst.get_instance_id_for_entity(redis, 'sim:9') is None
+    assert inst.get_instance_id_for_entity(redis, 'order:9') is None
 
 
 def test_cancel_by_dispatch_id(redis):
@@ -268,10 +268,10 @@ def test_cancel_by_dispatch_id(redis):
 
 def test_batch_runs_full_batches_then_the_window_remainder(redis):
     batches = []
-    worker = Worker(redis, [make_job('Merge', lambda job, items, **kw: (batches.append([i['sim'] for i in items]), setattr(job, 'success', True)))])
+    worker = Worker(redis, [make_job('Merge', lambda job, items, **kw: (batches.append([i['order'] for i in items]), setattr(job, 'success', True)))])
     q = WorkQueue(redis)
-    for sim in range(5):
-        q.publish_to_batch('Merge', {'sim': sim}, batch_key='verizon', max_items=3, window_seconds=0.2)
+    for order in range(5):
+        q.publish_to_batch('Merge', {'order': order}, batch_key='partner-api', max_items=3, window_seconds=0.2)
 
     drain(worker, ticks=3)
     assert batches == [[0, 1, 2]]
@@ -285,20 +285,20 @@ def test_batch_retries_only_failed_items_then_dead_letters_them(redis):
     batches = []
 
     def merge(job, items, **kwargs):
-        batches.append([i['sim'] for i in items])
-        job.failed_items = {n: 'carrier rejected' for n, i in enumerate(items) if i['sim'] == 1}
+        batches.append([i['order'] for i in items])
+        job.failed_items = {n: 'partner API rejected' for n, i in enumerate(items) if i['order'] == 1}
         job.success = True
 
     worker = Worker(redis, [make_job('Merge', merge)], retry_policy=RetryPolicy(base=0.01, cap=0.02))
     q = WorkQueue(redis)
-    for sim in range(3):
-        q.publish_to_batch('Merge', {'sim': sim}, max_items=3, window_seconds=60, max_attempts=2)
+    for order in range(3):
+        q.publish_to_batch('Merge', {'order': order}, max_items=3, window_seconds=60, max_attempts=2)
 
     drain(worker, ticks=8)
 
     assert batches == [[0, 1, 2], [1]]
     dlq = [json.loads(e[1][b'data']) for e in redis.xrange(dispatch.DLQ_STREAM)]
-    assert [(d['params'], d['error']) for d in dlq] == [({'sim': 1}, 'carrier rejected')]
+    assert [(d['params'], d['error']) for d in dlq] == [({'order': 1}, 'partner API rejected')]
     assert not redis.keys('nuts|batch|inflight|*')
 
 
@@ -306,16 +306,16 @@ def test_batch_exception_retries_same_items(redis):
     calls = []
 
     def flaky(job, items, **kwargs):
-        calls.append([i['sim'] for i in items])
+        calls.append([i['order'] for i in items])
         if len(calls) == 1:
             raise RuntimeError('timeout')
         job.success = True
 
     worker = Worker(redis, [make_job('Merge', flaky)], retry_policy=RetryPolicy(base=0.01, cap=0.02))
     q = WorkQueue(redis)
-    for sim in range(2):
-        q.publish_to_batch('Merge', {'sim': sim}, max_items=2)
-    q.publish_to_batch('Merge', {'sim': 99}, max_items=2, window_seconds=60)
+    for order in range(2):
+        q.publish_to_batch('Merge', {'order': order}, max_items=2)
+    q.publish_to_batch('Merge', {'order': 99}, max_items=2, window_seconds=60)
 
     drain(worker, ticks=8)
     assert calls[:2] == [[0, 1], [0, 1]]

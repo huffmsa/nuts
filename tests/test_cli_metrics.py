@@ -31,17 +31,17 @@ def succeed(job, **kwargs):
 
 
 def explode(job, **kwargs):
-    raise RuntimeError('carrier said no')
+    raise RuntimeError('partner API said no')
 
 
 @pytest.fixture
 def job_package(tmp_path, monkeypatch):
     pkg = tmp_path / 'myjobs'
-    (pkg / 'carrier').mkdir(parents=True)
+    (pkg / 'partner').mkdir(parents=True)
     (pkg / '__init__.py').write_text('')
     (pkg / 'helpers.py').write_text('VALUE = 1\n')
-    (pkg / 'carrier' / '__init__.py').write_text('')
-    for module, name in [('ping', 'Ping'), ('carrier/refresh', 'Refresh')]:
+    (pkg / 'partner' / '__init__.py').write_text('')
+    for module, name in [('ping', 'Ping'), ('partner/refresh', 'Refresh')]:
         (pkg / f'{module}.py').write_text(textwrap.dedent(f'''
             from nuts import NutsJob
 
@@ -69,11 +69,11 @@ def test_load_job_modules_walks_packages(job_package):
 
 def test_publish_command_prints_dispatch_id(redis, capsys):
     url = os.environ['NUTS_TEST_REDIS_URL']
-    cli.main(['--redis-url', url, 'publish', 'Ping', '{"sim": 1}', '--priority', 'high'])
+    cli.main(['--redis-url', url, 'publish', 'Ping', '{"order": 1}', '--priority', 'high'])
     dispatch_id = capsys.readouterr().out.strip()
     fields = redis.xrange(dispatch.stream_key('high'))[0][1]
     payload = json.loads(fields[b'data'])
-    assert payload['dispatch_id'] == dispatch_id and payload['params'] == {'sim': 1}
+    assert payload['dispatch_id'] == dispatch_id and payload['params'] == {'order': 1}
     with pytest.raises(SystemExit):
         cli.main(['--redis-url', url, 'publish', 'Ping', '{nope'])
 
@@ -86,7 +86,7 @@ def test_worker_command_runs_jobs_and_stops_on_sigterm(redis, job_package):
         cwd=job_package, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
     try:
-        WorkQueue(redis).publish('Refresh', {'sim': 1})
+        WorkQueue(redis).publish('Refresh', {'order': 1})
         deadline = time.time() + 15
         while time.time() < deadline and not redis.xlen(dispatch.HISTORY_STREAM):
             time.sleep(0.1)
@@ -114,7 +114,7 @@ def test_on_job_finished_sees_every_outcome(redis):
     worker.run()
     assert [(e['job_name'], e['outcome']) for e in events] == [('Ok', 'succeeded'), ('Boom', 'dead')]
     assert events[0]['duration_seconds'] is not None
-    assert events[1]['error'] == 'carrier said no'
+    assert events[1]['error'] == 'partner API said no'
     assert redis.xlen(dispatch.HISTORY_STREAM) == 0
 
 

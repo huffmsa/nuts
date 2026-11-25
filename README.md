@@ -169,12 +169,12 @@ Some downstream APIs take many items per call. `publish_to_batch` collects items
 
 ```python
 queue.publish_to_batch(
-    'UpdateDevices',
-    {'sim': 1234, 'plan': 'b'},
-    batch_key='verizon:change_plan',  # items are grouped by job, priority and batch_key
+    'UpdateOrders',
+    {'order_id': 1234, 'status': 'shipped'},
+    batch_key='partner-api:order_status',  # items are grouped by job, priority and batch_key
     max_items=500,                     # run as soon as this many are waiting
     window_seconds=10,                 # or this long after the first item, whichever is first
-    concurrency_key='verizon',
+    concurrency_key='partner-api',
 )
 ```
 
@@ -184,10 +184,10 @@ The job receives `items`, a list of the params each item was published with. To 
 class Job(NutsJob):
     def __init__(self):
         super().__init__()
-        self.name = 'UpdateDevices'
+        self.name = 'UpdateOrders'
 
     def run(self, items, **kwargs):
-        response = carrier.update([i['sim'] for i in items])
+        response = partner_api.update_orders(items)
         self.failed_items = {n: err for n, err in response.errors.items()}
         self.success = True
 ```
@@ -333,15 +333,15 @@ Add `timeout_seconds` to a wait step to give up if the signal doesn't arrive in 
 
 #### Instances Tied to an Entity
 
-Pass `entity_key` to tie an instance to something outside NUTS, such as a device or an order. The code that produces signals then only needs to know the entity:
+Pass `entity_key` to tie an instance to something outside NUTS, such as an order or a user account. The code that produces signals then only needs to know the entity:
 
 ```python
 from nuts import create_instance, signal_entity, cancel_entity
 
-create_instance(redis, 'configure-sim', plan, params, entity_key='sim:1234', replace=True)
+create_instance(redis, 'fulfil-order', plan, params, entity_key='order:1234', replace=True)
 
-# later, from whatever sees the device come online
-signal_entity(redis, 'sim:1234', 'device_online', {'seen_at': '...'})
+# later, from whatever sees the payment arrive
+signal_entity(redis, 'order:1234', 'payment_received', {'seen_at': '...'})
 ```
 
 Each entity has at most one active instance. Creating another raises `EntityBusyError`, unless `replace=True`, in which case the old one is cancelled and the new one takes its place. `cancel_instance(redis, instance_id)` and `cancel_entity(redis, entity_key)` stop an instance: steps not yet started never run, a queued step is skipped, and a running step finishes but nothing after it starts.
@@ -373,7 +373,7 @@ nuts worker myapp.jobs --max-concurrent-jobs 8 --workflows ./workflows
 nuts web --host 0.0.0.0 --port 8000
 
 # Queue a job and print its dispatch id
-nuts publish RefreshSim '{"sim_id": 42}' --priority high --delay 30
+nuts publish RefreshOrder '{"order_id": 42}' --priority high --delay 30
 ```
 
 Jobs usually need shared things like database clients, and a worker needs options the flags don't cover. Pass `--setup module:function`. The function runs once at startup and returns a dict, which is handed to `Worker` like keyword arguments: worker options are used, and everything else reaches each job's `run()`.
