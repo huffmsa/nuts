@@ -106,6 +106,7 @@ class Worker():
         self.history_length = kwargs.pop('history_length', 1000)
         self.consumer_prune_after_ms = kwargs.pop('consumer_prune_after_ms', 3600000)
         self.leader_tick_budget_seconds = kwargs.pop('leader_tick_budget_seconds', 5.0)
+        self.on_job_finished = kwargs.pop('on_job_finished', None)
         self.heartbeat_interval_seconds = kwargs.pop(
             'heartbeat_interval_seconds', max(0.01, self.pel_min_idle_ms / 1000 / 3)
         )
@@ -122,11 +123,6 @@ class Worker():
         self.concurrency = ConcurrencyGate(redis)
 
         self.logger = logging.getLogger(f'worker|{self.id}')
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s - %(levelname)s - %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
 
         self.registry = JobRegistry(jobs)
         self.workflow_directory = workflow_directory
@@ -653,23 +649,29 @@ class Worker():
 
     def _record(self, payload: dict, outcome: str, error: Union[str, None] = None,
                 started: Union[float, None] = None, **extra):
+        entry = {
+            'dispatch_id': payload.get('dispatch_id'),
+            'job_name': payload.get('job_name'),
+            'outcome': outcome,
+            'error': error,
+            'attempt': payload.get('attempt', 1),
+            'priority': payload.get('priority'),
+            'instance_id': payload.get('instance_id'),
+            'step_id': payload.get('step_id'),
+            'worker_id': self.id,
+            'finished_at': _now_ts(),
+            'duration_seconds': round(time.monotonic() - started, 3) if started is not None else None,
+            **extra,
+        }
         try:
-            dispatch.record_history(self.redis, {
-                'dispatch_id': payload.get('dispatch_id'),
-                'job_name': payload.get('job_name'),
-                'outcome': outcome,
-                'error': error,
-                'attempt': payload.get('attempt', 1),
-                'priority': payload.get('priority'),
-                'instance_id': payload.get('instance_id'),
-                'step_id': payload.get('step_id'),
-                'worker_id': self.id,
-                'finished_at': _now_ts(),
-                'duration_seconds': round(time.monotonic() - started, 3) if started is not None else None,
-                **extra,
-            }, self.history_length)
+            dispatch.record_history(self.redis, entry, self.history_length)
         except Exception as ex:
             self.logger.error(f'Could not record history: {ex}')
+        if self.on_job_finished is not None:
+            try:
+                self.on_job_finished(entry)
+            except Exception as ex:
+                self.logger.error(f'on_job_finished hook failed: {ex}')
 
     def _give_up(self, payload: dict, error: str):
         if payload.get('batch'):

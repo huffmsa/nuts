@@ -5,12 +5,13 @@ from typing import Any, Optional, Sequence
 from urllib.parse import urlencode
 
 from fastapi import Depends, FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from redis import Redis
 
 from .. import admin
 from .. import dispatch
+from .. import metrics
 
 TEMPLATES_DIR = os.path.join(os.path.dirname(__file__), 'templates')
 
@@ -119,6 +120,10 @@ def create_app(redis: Optional[Redis] = None, dependencies: Optional[Sequence[De
             return {'status': 'ok'}
         except Exception as ex:
             return JSONResponse({'status': 'error', 'error': str(ex)}, status_code=503)
+
+    @app.get('/metrics', response_class=PlainTextResponse)
+    def metrics_page():
+        return PlainTextResponse(metrics.render(r()), media_type=metrics.CONTENT_TYPE)
 
     @app.get('/', response_class=HTMLResponse, name='overview')
     def overview(request: Request):

@@ -74,6 +74,13 @@ Worker options:
 | `leader_tick_budget_seconds` | 5.0 | Max time per tick spent advancing workflow instances |
 | `full_sweep_interval_seconds` | 300 | How often the leader re-checks every active instance as a safety net |
 | `instance_ttl_seconds` | 604800 | How long finished instances are kept |
+| `history_length` | 1000 | Finished attempts kept for the admin UI's History page; 0 turns it off |
+| `consumer_prune_after_ms` | 3600000 | How long a worker can be gone before the leader removes its entry |
+| `on_job_finished` | None | Called with a dict for every finished attempt. See [Metrics](#metrics) |
+
+The worker logs through the standard `logging` module and doesn't configure it. Call `logging.basicConfig()` in your entry point, or use `nuts worker`, which does it for you.
+
+You can also skip `main.py` and use the [command line](#command-line).
 
 
 ### Jobs
@@ -353,6 +360,40 @@ NUTS supports three ways to chain jobs:
 2. **Dynamic Instances (`create_instance`)**: Best when the step set or parameters vary per run -- per-entity pipelines, steps composed at runtime, or a step that needs to wait on an external event.
 3. **DAG Jobs (`job.next`)**: Best for simple linear chains where you just want the next job to run with this job's result.
 
+## Command Line
+
+Installing the package adds a `nuts` command. Every subcommand reads `--redis-url`, or `$REDIS_URL`, falling back to `redis://localhost:6379`.
+
+```bash
+# Run a worker. Each argument is a module with a Job class, or a package
+# whose submodules are searched for them. Stops cleanly on SIGTERM or Ctrl-C.
+nuts worker myapp.jobs --max-concurrent-jobs 8 --workflows ./workflows
+
+# Serve the admin UI (needs the web extra)
+nuts web --host 0.0.0.0 --port 8000
+
+# Queue a job and print its dispatch id
+nuts publish RefreshSim '{"sim_id": 42}' --priority high --delay 30
+```
+
+Jobs usually need shared things like database clients, and a worker needs options the flags don't cover. Pass `--setup module:function`. The function runs once at startup and returns a dict, which is handed to `Worker` like keyword arguments: worker options are used, and everything else reaches each job's `run()`.
+
+```python
+# myapp/nuts_setup.py
+def configure():
+    return {
+        'db': make_db_pool(),
+        'retry_policy': RetryPolicy(max_attempts=8),
+        'on_job_finished': report_to_datadog,
+    }
+```
+
+```bash
+nuts worker myapp.jobs --setup myapp.nuts_setup:configure
+```
+
+Modules named on the command line are imported from the current directory first, as with `uvicorn`.
+
 ## Admin UI
 
 An optional, server-rendered admin UI ships with the package. It's plain HTML from FastAPI and Jinja templates, with no JavaScript build and nothing extra to deploy.
@@ -396,6 +437,30 @@ admin.overview(redis)
 admin.redrive(redis, admin.dead_letters(redis)[0]['entry_id'])
 ```
 
+## Metrics
+
+There are two sources, and neither needs anything beyond what you already run.
+
+**Gauges from Redis.** The admin app serves `/metrics` in the Prometheus text format: queue depth and in-flight per priority, delayed, retrying, dead letters, active workflow instances, live workers, whether a leader exists, and holders and waiters per concurrency key. They're read from Redis, so any admin process reports the whole system. Prometheus, the Datadog agent's OpenMetrics check, or Grafana Alloy can scrape it.
+
+**Per-job events from workers.** A worker can't report counters for the whole system, so it calls `on_job_finished` with a dict for each finished attempt instead. Keys: `job_name`, `outcome` (`succeeded`, `retrying`, `dead`, `reclaimed`, `cancelled`), `duration_seconds`, `attempt`, `priority`, `error`, `dispatch_id`, `instance_id`, `step_id`, `worker_id`, `finished_at`. Send it wherever you like. It runs on the job's thread, so keep it quick. Exceptions are logged and ignored.
+
+```python
+from datadog import statsd
+
+def report_to_datadog(event):
+    tags = [f"job:{event['job_name']}", f"outcome:{event['outcome']}"]
+    statsd.increment('nuts.job.finished', tags=tags)
+    if event['duration_seconds'] is not None:
+        statsd.distribution('nuts.job.duration', event['duration_seconds'], tags=tags)
+
+Worker(redis, jobs, on_job_finished=report_to_datadog)
+```
+
+## Roadmap
+
+See [ROADMAP.md](ROADMAP.md) for planned features.
+
 ## Development
 
 The tests run `FLUSHALL`, so point them at a throwaway Redis.
@@ -406,4 +471,16 @@ docker run -d --rm --name nuts-test-redis -p 6390:6379 redis:7
 NUTS_TEST_REDIS_URL=redis://localhost:6390/0 pytest
 ```
 
-`make build` and `make publish` build and upload to PyPI.
+CI runs the tests on every push to `master` and every pull request. The matrix covers Python 3.11 to 3.14 and Redis 6.2 to 8, plus one run that installs the oldest version of every dependency the package allows.
+
+To release, bump `version` in `pyproject.toml`, commit, then push a matching tag:
+
+```bash
+git tag v1.0.0 && git push origin v1.0.0
+```
+
+The Publish workflow runs CI, checks that the tag matches the version, then uploads to PyPI through trusted publishing, so no token is stored anywhere. One-time setup:
+- On PyPI, add a trusted publisher to `nuts-scheduler`: owner `huffmsa`, repository `nuts`, workflow `publish.yml`, environment `pypi`.
+- In the GitHub repository settings, create an environment named `pypi`.
+
+`make publish` still uploads from your machine with a token, if you need it.

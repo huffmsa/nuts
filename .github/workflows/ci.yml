@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_call:
+
+jobs:
+  test:
+    name: Python ${{ matrix.python }}, Redis ${{ matrix.redis }}, ${{ matrix.resolution }} deps
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { python: '3.11', redis: '6.2', resolution: lowest-direct }
+          - { python: '3.11', redis: '7', resolution: highest }
+          - { python: '3.12', redis: '7', resolution: highest }
+          - { python: '3.13', redis: '8', resolution: highest }
+          - { python: '3.14', redis: '8', resolution: highest }
+    services:
+      redis:
+        image: redis:${{ matrix.redis }}
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 2s --health-timeout 2s --health-retries 15
+    env:
+      NUTS_TEST_REDIS_URL: redis://localhost:6379/0
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          activate-environment: true
+          python-version: ${{ matrix.python }}
+      - run: uv pip install --resolution ${{ matrix.resolution }} -e '.[dev]'
+      - run: pytest -q
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          activate-environment: true
+          python-version: '3.13'
+      - run: uv build
+      - run: uvx twine check dist/*

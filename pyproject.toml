@@ -25,7 +25,10 @@ classifiers = [
 
 [project.optional-dependencies]
 web = ["fastapi>=0.110.0", "uvicorn>=0.27.0", "jinja2>=3.1", "python-multipart>=0.0.9"]
-dev = ["nuts-scheduler[web]", "pytest>=8", "httpx", "build", "twine"]
+dev = ["nuts-scheduler[web]", "pytest>=8", "httpx>=0.25", "build>=1.0", "twine>=5"]
+
+[project.scripts]
+nuts = "nuts.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/huffmsa/nuts"
@@ -35,4 +38,5 @@ Issues = "https://github.com/huffmsa/nuts/issues"
 include = ["nuts", "nuts.*"]
 
 [tool.setuptools.package-data]
+nuts = ["py.typed"]
 "nuts.web" = ["templates/*.html"]
