@@ -3,10 +3,10 @@ import tempfile
 import os
 import shutil
 import yaml
-from ..nuts.worker import Worker
-from ..nuts.job import NutsJob
-from ..nuts import instance as inst
-from ..nuts import dispatch
+from nuts.worker import Worker
+from nuts.job import NutsJob
+from nuts import instance as inst
+from nuts import dispatch
 
 
 def _worker(redis, jobs, **kwargs):
@@ -216,7 +216,7 @@ def test_dlq_after_max_retries_fails_the_step_not_the_whole_run(redis):
             def run(self, **kwargs):
                 raise RuntimeError('boom')
 
-    from ..nuts.worker import RetryPolicy
+    from nuts.worker import RetryPolicy
     worker = _worker(redis, [AlwaysFailMod], retry_policy=RetryPolicy(base=0.01, cap=0.02, max_attempts=1))
     plan = [{'step_id': 'fail', 'op': 'AlwaysFail', 'requires': None, 'max_attempts': 1}]
     instance_id = inst.create_instance(redis, 'wf', plan)

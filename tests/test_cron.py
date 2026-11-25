@@ -1,5 +1,5 @@
 import datetime
-from ..nuts.cron import Cron
+from nuts.cron import Cron
 
 cron = Cron()
 

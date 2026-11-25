@@ -1,5 +1,5 @@
-from ..nuts.queue import WorkQueue
-from ..nuts import dispatch
+from nuts.queue import WorkQueue
+from nuts import dispatch
 
 
 def test_publish_immediate_dispatches_to_priority_stream(redis):

@@ -1,4 +1,4 @@
-from ..nuts.concurrency import ConcurrencyGate
+from nuts.concurrency import ConcurrencyGate
 
 
 def test_acquire_respects_limit(redis):

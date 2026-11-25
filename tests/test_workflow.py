@@ -1,5 +1,5 @@
 import pytest
-from ..nuts.workflow import NutsWorkflow, WorkflowJob, validate_dag
+from nuts.workflow import NutsWorkflow, WorkflowJob, validate_dag
 
 
 def test_workflow_initialization():

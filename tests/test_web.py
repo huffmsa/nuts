@@ -6,13 +6,13 @@ pytest.importorskip('fastapi')
 pytest.importorskip('jinja2')
 from fastapi.testclient import TestClient
 
-from ..nuts.web import create_app
-from ..nuts.worker import Worker, RetryPolicy
-from ..nuts.job import NutsJob
-from ..nuts.queue import WorkQueue
-from ..nuts import dispatch
-from ..nuts import admin
-from ..nuts import instance as inst
+from nuts.web import create_app
+from nuts.worker import Worker, RetryPolicy
+from nuts.job import NutsJob
+from nuts.queue import WorkQueue
+from nuts import dispatch
+from nuts import admin
+from nuts import instance as inst
 
 
 def make_job(name, fn):

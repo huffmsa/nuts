@@ -11,7 +11,7 @@ Delivery is backed by Redis Streams: work is never lost (a crashed worker's clai
 
 ## Installation
 
-Nuts is available as a published Python package for versions >=3.8.
+Nuts is a published Python package. It needs Python 3.11+ and Redis 6.2+ (a single node, not Cluster).
 
 ```bash
 pip install nuts-scheduler
@@ -395,3 +395,15 @@ from nuts import admin
 admin.overview(redis)
 admin.redrive(redis, admin.dead_letters(redis)[0]['entry_id'])
 ```
+
+## Development
+
+The tests run `FLUSHALL`, so point them at a throwaway Redis.
+
+```bash
+pip install -e '.[dev]'
+docker run -d --rm --name nuts-test-redis -p 6390:6379 redis:7
+NUTS_TEST_REDIS_URL=redis://localhost:6390/0 pytest
+```
+
+`make build` and `make publish` build and upload to PyPI.

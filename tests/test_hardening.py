@@ -2,11 +2,11 @@ import json
 import threading
 import time
 import pytest
-from ..nuts.worker import Worker, RetryPolicy
-from ..nuts.job import NutsJob
-from ..nuts.queue import WorkQueue
-from ..nuts import dispatch
-from ..nuts import instance as inst
+from nuts.worker import Worker, RetryPolicy
+from nuts.job import NutsJob
+from nuts.queue import WorkQueue
+from nuts import dispatch
+from nuts import instance as inst
 
 
 def make_job(name, fn, **attrs):

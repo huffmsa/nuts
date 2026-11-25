@@ -1,5 +1,5 @@
 import pytest
-from ..nuts import instance as inst
+from nuts import instance as inst
 
 
 def _plan(*step_ids_with_requires):

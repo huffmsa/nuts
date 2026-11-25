@@ -1,9 +1,9 @@
 import time
 import json
-from ..nuts.worker import Worker, RetryPolicy
-from ..nuts.job import NutsJob
-from ..nuts.queue import WorkQueue
-from ..nuts import dispatch
+from nuts.worker import Worker, RetryPolicy
+from nuts.job import NutsJob
+from nuts.queue import WorkQueue
+from nuts import dispatch
 
 
 def _worker(redis, jobs, **kwargs):

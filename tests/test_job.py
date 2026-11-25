@@ -1,4 +1,4 @@
-from ..nuts.job import NutsJob, JobRegistry
+from nuts.job import NutsJob, JobRegistry
 
 
 def test_job():

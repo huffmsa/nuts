@@ -1,8 +1,9 @@
 clean:
-	rm -r dist
+	rm -rf dist build *.egg-info
 
-build:
+build: clean
 	python -m build
 
-publish:
+publish: build
+	python -m twine check dist/*
 	python -m twine upload --repository pypi dist/* --verbose
